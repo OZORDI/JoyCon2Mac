@@ -9,12 +9,10 @@
 #include <DriverKit/OSDictionary.h>
 #include <DriverKit/OSNumber.h>
 #include <DriverKit/OSString.h>
-#include <DriverKit/OSBoolean.h>
 #include <DriverKit/OSAction.h>
 #include <DriverKit/IOUserClient.h>
 #include <HIDDriverKit/IOHIDDeviceKeys.h>
 #include <HIDDriverKit/IOHIDDeviceTypes.h>
-#include <HIDDriverKit/IOHIDEventServiceKeys.h>
 #include <HIDDriverKit/IOHIDUsageTables.h>
 
 // ---------------------------------------------------------------------------
@@ -107,8 +105,7 @@ enum : uint8_t {
 enum : uint32_t {
     kVirtualLocationGamepad   = 0x4A433201,
     kVirtualLocationDualSense = 0x4A433202,
-    kVirtualLocationMouse     = 0x4A433203,
-    kVirtualMousePointerReportRateHz = 67
+    kVirtualLocationMouse     = 0x4A433203
 };
 
 static JoyConRumbleReportData g_latestRumbleReport = {};
@@ -965,37 +962,28 @@ OSData * VirtualJoyConMouseDevice::newReportDescriptor() {
 }
 
 OSDictionary * VirtualJoyConMouseDevice::newDeviceDescription() {
-    OSDictionary * description = OSDictionary::withCapacity(16);
+    OSDictionary * description = OSDictionary::withCapacity(10);
     if (!description) {
         return nullptr;
     }
 
-    OSNumber * vendor            = OSNumber::withNumber(static_cast<uint32_t>(0x057E), 32);
-    OSNumber * product           = OSNumber::withNumber(static_cast<uint32_t>(0x2067), 32);
-    OSNumber * version           = OSNumber::withNumber(static_cast<uint32_t>(1), 32);
-    OSNumber * location          = OSNumber::withNumber(kVirtualLocationMouse, 32);
-    OSNumber * pointerReportRate = OSNumber::withNumber(kVirtualMousePointerReportRateHz, 32);
-    OSString * transport         = OSString::withCString("Bluetooth");
-    OSString * manufacturer      = OSString::withCString("JoyCon2Mac");
-    OSString * productName       = OSString::withCString("JoyCon2Mac Bluetooth Mouse");
-    OSString * serial            = OSString::withCString("JoyCon2Mac-Mouse-01");
-    OSString * pointerAccelType  = OSString::withCString(kIOHIDMouseAccelerationTypeKey);
-    OSString * scrollAccelType   = OSString::withCString(kIOHIDMouseScrollAccelerationKey);
+    OSNumber * vendor       = OSNumber::withNumber(static_cast<uint32_t>(0x057E), 32);
+    OSNumber * product      = OSNumber::withNumber(static_cast<uint32_t>(0x2067), 32);
+    OSNumber * version      = OSNumber::withNumber(static_cast<uint32_t>(1), 32);
+    OSNumber * location     = OSNumber::withNumber(kVirtualLocationMouse, 32);
+    OSString * transport    = OSString::withCString("Bluetooth");
+    OSString * manufacturer = OSString::withCString("JoyCon2Mac");
+    OSString * productName  = OSString::withCString("JoyCon2Mac Bluetooth Mouse");
+    OSString * serial       = OSString::withCString("JoyCon2Mac-Mouse-01");
 
-    if (vendor)            { description->setObject(kIOHIDVendorIDKey,                 vendor);            vendor->release(); }
-    if (product)           { description->setObject(kIOHIDProductIDKey,                product);           product->release(); }
-    if (version)           { description->setObject(kIOHIDVersionNumberKey,            version);           version->release(); }
-    if (location)          { description->setObject(kIOHIDLocationIDKey,               location);          location->release(); }
-    if (transport)         { description->setObject(kIOHIDTransportKey,                transport);         transport->release(); }
-    if (manufacturer)      { description->setObject(kIOHIDManufacturerKey,             manufacturer);      manufacturer->release(); }
-    if (productName)       { description->setObject(kIOHIDProductKey,                  productName);       productName->release(); }
-    if (serial)            { description->setObject(kIOHIDSerialNumberKey,             serial);            serial->release(); }
-    if (pointerReportRate) { description->setObject(kHIDPointerReportRateKey,          pointerReportRate); pointerReportRate->release(); }
-    if (pointerAccelType)  { description->setObject(kIOHIDPointerAccelerationTypeKey,  pointerAccelType);  pointerAccelType->release(); }
-    if (scrollAccelType)   { description->setObject(kIOHIDScrollAccelerationTypeKey,   scrollAccelType);   scrollAccelType->release(); }
-
-    description->setObject(kIOHIDPointerAccelerationSupportKey, kOSBooleanTrue);
-    description->setObject(kIOHIDScrollAccelerationSupportKey,  kOSBooleanTrue);
+    if (vendor)       { description->setObject(kIOHIDVendorIDKey,       vendor);       vendor->release(); }
+    if (product)      { description->setObject(kIOHIDProductIDKey,      product);      product->release(); }
+    if (version)      { description->setObject(kIOHIDVersionNumberKey,  version);      version->release(); }
+    if (location)     { description->setObject(kIOHIDLocationIDKey,     location);     location->release(); }
+    if (transport)    { description->setObject(kIOHIDTransportKey,      transport);    transport->release(); }
+    if (manufacturer) { description->setObject(kIOHIDManufacturerKey,   manufacturer); manufacturer->release(); }
+    if (productName)  { description->setObject(kIOHIDProductKey,        productName);  productName->release(); }
+    if (serial)       { description->setObject(kIOHIDSerialNumberKey,   serial);       serial->release(); }
 
     return description;
 }

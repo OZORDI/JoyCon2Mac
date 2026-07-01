@@ -28,11 +28,7 @@
 @property (nonatomic, assign) int16_t lastOpticalYLeft;
 @property (nonatomic, assign) int16_t lastOpticalXRight;
 @property (nonatomic, assign) int16_t lastOpticalYRight;
-@property (nonatomic, assign) float pendingMoveX;
-@property (nonatomic, assign) float pendingMoveY;
-@property (nonatomic, assign) float pendingScroll;
-@property (nonatomic, strong) dispatch_queue_t pointerQueue;
-@property (nonatomic, strong) dispatch_source_t pointerTimer;
+@property (nonatomic, assign) float scrollAccumulator;
 
 // Per-side rolling state used by Auto to decide which Joy-Con owns the
 // pointer. `lastDistance*` is the latest surface-distance reading; `airFrames*`
@@ -65,31 +61,13 @@
 
 @property (nonatomic, assign) JoyConSide lastActiveSide;
 
-- (void)sendSmoothedMoveDeltaX:(float)dx deltaY:(float)dy;
 - (void)sendMouseButton:(uint8_t)bit down:(BOOL)down;
 - (void)postMouseReportDeltaX:(int)dx deltaY:(int)dy scroll:(int)scroll;
 - (void)sendXButton:(int)which;
 - (void)releaseAllMouseButtons;
-- (void)resetPointerSmoothing;
-- (void)startPointerTimer;
-- (void)flushPointerSmoothing;
 - (BOOL)isSideOnSurface:(JoyConSide)side;
 - (JoyConSide)resolvedActiveSide;
 @end
-
-static const uint64_t kPointerTimerIntervalNanos = 8333333ULL; // 1 / 120 s
-
-static int RoundedTimerPointerStep(float pending, float threshold) {
-    if (std::fabs(pending) < threshold) {
-        return 0;
-    }
-
-    int step = static_cast<int>(std::lrintf(pending));
-    if (step == 0) {
-        step = pending > 0.0f ? 1 : -1;
-    }
-    return std::clamp(step, -512, 512);
-}
 
 static int16_t ClampMouseDelta(int value) {
     return static_cast<int16_t>(std::clamp(value, -32768, 32767));
@@ -120,25 +98,15 @@ static int8_t ClampMouseWheel(int value) {
         _lastOpticalYLeft = 0;
         _lastOpticalXRight = 0;
         _lastOpticalYRight = 0;
-        _pendingMoveX = 0.0f;
-        _pendingMoveY = 0.0f;
-        _pendingScroll = 0.0f;
+        _scrollAccumulator = 0.0f;
         _leftBtnPressed = NO;
         _rightBtnPressed = NO;
         _middleBtnPressed = NO;
         _mb4Pressed = NO;
         _mb5Pressed = NO;
         _hidButtons = 0;
-        [self startPointerTimer];
     }
     return self;
-}
-
-- (void)dealloc {
-    if (_pointerTimer) {
-        dispatch_source_cancel(_pointerTimer);
-        _pointerTimer = nil;
-    }
 }
 
 - (void)setCurrentMode:(MouseMode)currentMode {
@@ -149,7 +117,7 @@ static int8_t ClampMouseWheel(int value) {
     // teleports across the screen" bug when you toggled OFF -> SLOW).
     _firstOpticalReadLeft = YES;
     _firstOpticalReadRight = YES;
-    [self resetPointerSmoothing];
+    _scrollAccumulator = 0.0f;
     if (currentMode == MouseModeOff) {
         [self releaseAllMouseButtons];
     }
@@ -162,7 +130,7 @@ static int8_t ClampMouseWheel(int value) {
     // for both sides so we don't compute a stale-vs-fresh delta.
     _firstOpticalReadLeft = YES;
     _firstOpticalReadRight = YES;
-    [self resetPointerSmoothing];
+    _scrollAccumulator = 0.0f;
     // Snap the active side to the picker's choice right away so the GUI's
     // "Active" badge flips the moment the user makes the selection, instead
     // of waiting for the next BLE packet to arrive from the chosen side.
@@ -281,7 +249,7 @@ static int8_t ClampMouseWheel(int value) {
         } else {
             _firstOpticalReadRight = YES;
         }
-        [self resetPointerSmoothing];
+        _scrollAccumulator = 0.0f;
         [self releaseAllMouseButtons];
         return NO;
     }
@@ -303,6 +271,8 @@ static int8_t ClampMouseWheel(int value) {
     BOOL *firstReadPtr  = isLeft ? &_firstOpticalReadLeft  : &_firstOpticalReadRight;
     int16_t *lastXPtr   = isLeft ? &_lastOpticalXLeft      : &_lastOpticalXRight;
     int16_t *lastYPtr   = isLeft ? &_lastOpticalYLeft      : &_lastOpticalYRight;
+    int moveX = 0;
+    int moveY = 0;
 
     if (*firstReadPtr) {
         *lastXPtr = rawX;
@@ -322,11 +292,8 @@ static int8_t ClampMouseWheel(int value) {
                 case MouseModeSlow:   sensitivity = 0.3f; break;
                 default: break;
             }
-            float moveX = dx * sensitivity;
-            float moveY = dy * sensitivity;
-            [self sendSmoothedMoveDeltaX:moveX deltaY:moveY];
-        } else {
-            [self sendSmoothedMoveDeltaX:0.0f deltaY:0.0f];
+            moveX = static_cast<int>(std::lrintf(dx * sensitivity));
+            moveY = static_cast<int>(std::lrintf(dy * sensitivity));
         }
     }
 
@@ -364,22 +331,25 @@ static int8_t ClampMouseWheel(int value) {
     }
 
     // --- 3. Stick scrolling + side buttons (joycon2cpp constants) ---
+    int scroll = 0;
     const int SCROLL_DEADZONE = 4000;
     if (std::abs((int)stickData.y) > SCROLL_DEADZONE) {
         float intensity = (std::abs((int)stickData.y) - SCROLL_DEADZONE) /
                           (32767.0f - SCROLL_DEADZONE);
-        float speed = std::pow(intensity, 1.35f) * 34.0f;
-        @synchronized (self) {
-            if (stickData.y > 0) _pendingScroll += speed; // Up
-            else                 _pendingScroll -= speed; // Down
+        float speed = intensity * 40.0f;
+        if (stickData.y > 0) _scrollAccumulator += speed; // Up
+        else                 _scrollAccumulator -= speed; // Down
+
+        if (std::fabs(_scrollAccumulator) >= 120.0f) {
+            scroll = static_cast<int>(_scrollAccumulator / 120.0f);
+            _scrollAccumulator -= scroll * 120.0f;
         }
     } else {
-        @synchronized (self) {
-            _pendingScroll *= 0.72f;
-            if (std::fabs(_pendingScroll) < 1.0f) {
-                _pendingScroll = 0.0f;
-            }
-        }
+        _scrollAccumulator = 0.0f;
+    }
+
+    if (moveX != 0 || moveY != 0 || scroll != 0) {
+        [self postMouseReportDeltaX:moveX deltaY:moveY scroll:scroll];
     }
 
     const int BUTTON_THRESHOLD = 28000;
@@ -486,74 +456,6 @@ static int8_t ClampMouseWheel(int value) {
     [_driverClient postMouseReport:report];
 }
 
-- (void)sendSmoothedMoveDeltaX:(float)dx deltaY:(float)dy {
-    if (dx == 0.0f && dy == 0.0f) {
-        return;
-    }
-
-    @synchronized (self) {
-        _pendingMoveX += dx;
-        _pendingMoveY += dy;
-    }
-}
-
-- (void)startPointerTimer {
-    if (_pointerTimer) {
-        return;
-    }
-
-    _pointerQueue = dispatch_queue_create("local.joycon2mac.mouse.pointer", DISPATCH_QUEUE_SERIAL);
-    _pointerTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _pointerQueue);
-    dispatch_source_set_timer(_pointerTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, kPointerTimerIntervalNanos),
-                              kPointerTimerIntervalNanos,
-                              1000000ULL);
-    __weak MouseEmitter *weakSelf = self;
-    dispatch_source_set_event_handler(_pointerTimer, ^{
-        [weakSelf flushPointerSmoothing];
-    });
-    dispatch_resume(_pointerTimer);
-}
-
-- (void)flushPointerSmoothing {
-    int outX = 0;
-    int outY = 0;
-    int outScroll = 0;
-
-    @synchronized (self) {
-        if (_currentMode == MouseModeOff) {
-            _pendingMoveX = 0.0f;
-            _pendingMoveY = 0.0f;
-            _pendingScroll = 0.0f;
-            return;
-        }
-
-        float pendingDistance = std::hypot(_pendingMoveX, _pendingMoveY);
-        if (std::fabs(_pendingScroll) >= 80.0f) {
-            outScroll = static_cast<int>(_pendingScroll / 80.0f);
-            outScroll = std::clamp(outScroll, -3, 3);
-            _pendingScroll -= outScroll * 80.0f;
-        }
-
-        if (pendingDistance < 0.35f &&
-            outScroll == 0) {
-            return;
-        }
-
-        float axisThreshold = pendingDistance >= 0.75f ? 0.50f : 0.75f;
-        outX = RoundedTimerPointerStep(_pendingMoveX, axisThreshold);
-        outY = RoundedTimerPointerStep(_pendingMoveY, axisThreshold);
-        if (outX == 0 && outY == 0 && outScroll == 0) {
-            return;
-        }
-
-        _pendingMoveX -= outX;
-        _pendingMoveY -= outY;
-    }
-
-    [self postMouseReportDeltaX:outX deltaY:outY scroll:outScroll];
-}
-
 - (void)sendMouseButton:(uint8_t)bit down:(BOOL)down {
     bit &= 0x1F;
     uint8_t oldButtons = _hidButtons;
@@ -586,14 +488,6 @@ static int8_t ClampMouseWheel(int value) {
     _middleBtnPressed = NO;
     _mb4Pressed = NO;
     _mb5Pressed = NO;
-}
-
-- (void)resetPointerSmoothing {
-    @synchronized (self) {
-        _pendingMoveX = 0.0f;
-        _pendingMoveY = 0.0f;
-        _pendingScroll = 0.0f;
-    }
 }
 
 @end
