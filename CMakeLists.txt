@@ -3,7 +3,7 @@ project(JoyCon2Mac)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0")
+set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0")
 
 # Require Xcode generator if we are building the driverkit extension
 if(NOT CMAKE_GENERATOR STREQUAL "Xcode")
@@ -50,7 +50,6 @@ if(CMAKE_GENERATOR STREQUAL "Xcode")
         XCODE_ATTRIBUTE_WRAPPER_EXTENSION "dext"
         XCODE_ATTRIBUTE_MACH_O_TYPE "mh_execute"
         XCODE_ATTRIBUTE_SDKROOT "driverkit"
-        XCODE_ATTRIBUTE_SYSTEM_HEADER_SEARCH_PATHS "$(inherited) $(SDKROOT)/System/DriverKit/usr/include"
         XCODE_ATTRIBUTE_USER_HEADER_SEARCH_PATHS "$(inherited) $(DERIVED_SOURCES_DIR)"
         XCODE_ATTRIBUTE_LIBRARY_SEARCH_PATHS "$(inherited) $(SDKROOT)/System/DriverKit/usr/lib"
         XCODE_ATTRIBUTE_GENERATE_INFOPLIST_FILE "YES"
