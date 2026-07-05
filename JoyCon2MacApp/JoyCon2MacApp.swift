@@ -11,8 +11,8 @@ struct JoyCon2MacApp: App {
         WindowGroup {
             MainWindow()
                 .environmentObject(daemonBridge)
-                .frame(minWidth: 800, minHeight: 600)
         }
+        .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
