@@ -48,6 +48,24 @@ open build/JoyCon2Mac.app
 build/JoyCon2Mac.app/Contents/Library/SystemExtensions/
 ```
 
+Building requires full Xcode (the DriverKit SDK is not part of the Command Line Tools). If only a beta Xcode is installed, point the build at it:
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer ./build_all.sh
+```
+
+### Signing Modes
+
+Without `CODE_SIGN_IDENTITY`, builds are ad-hoc signed **without** the restricted `com.apple.developer.system-extension.install` entitlement — macOS kills ad-hoc apps that carry it at launch ("The application \"JoyCon2Mac\" can't be opened"), which is also why older releases refused to start on stock Macs. Such builds launch anywhere, but cannot activate the DriverKit extension, so only telemetry works.
+
+To get the full driver on a SIP/AMFI-disabled development machine, keep the entitlement:
+
+```bash
+FORCE_ENTITLEMENTS=1 ./build_all.sh
+```
+
+With a real signing identity (`CODE_SIGN_IDENTITY=...`), entitlements are always embedded.
+
 ## What Works
 
 ### Gamepad

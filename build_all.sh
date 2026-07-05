@@ -32,9 +32,14 @@ embed_dext() {
     /bin/rm -rf "$SYSTEM_EXTENSIONS_DIR/VirtualJoyConDriver.dext"
     /bin/rm -rf "$SYSTEM_EXTENSIONS_DIR/$DEXT_NAME"
     cp -R "$source" "$SYSTEM_EXTENSIONS_DIR/$DEXT_NAME"
-    codesign -s "$SIGN_IDENTITY" -f --deep --generate-entitlement-der \
-        --entitlements "$ROOT_DIR/JoyCon2MacApp/JoyCon2Mac.entitlements" \
-        "$ROOT_DIR/build/JoyCon2Mac.app" >/dev/null
+    if [ "$SIGN_IDENTITY" = "-" ] && [ "${FORCE_ENTITLEMENTS:-0}" != "1" ]; then
+        codesign -s "$SIGN_IDENTITY" -f --deep \
+            "$ROOT_DIR/build/JoyCon2Mac.app" >/dev/null
+    else
+        codesign -s "$SIGN_IDENTITY" -f --deep --generate-entitlement-der \
+            --entitlements "$ROOT_DIR/JoyCon2MacApp/JoyCon2Mac.entitlements" \
+            "$ROOT_DIR/build/JoyCon2Mac.app" >/dev/null
+    fi
 }
 
 # If we already have a pre-built dext around, embed it immediately so
