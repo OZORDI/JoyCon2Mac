@@ -2,6 +2,8 @@
 #import "PairingManager.h"
 #include <iostream>
 #include <cmath>
+#include <algorithm>
+#include <cstring>
 
 static const uint16_t NINTENDO_MANUFACTURER_ID = 0x0553;
 static NSString *const UUID_INPUT = @"ab7de9be-89fe-49ad-828f-118f09df7fd2";
@@ -36,6 +38,11 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
 @property (nonatomic, assign) uint8_t vibrationCounter;
 @property (nonatomic, assign) uint8_t lastRumbleAmplitude;
 @property (nonatomic, assign) BOOL hasLastRumbleAmplitude;
+@property (nonatomic, assign) BOOL nfcScanning;
+@property (nonatomic, strong) NSTimer *nfcPollTimer;
+@property (nonatomic, assign) uint8_t nfcOutputCounter;
+@property (nonatomic, assign) NSUInteger nfcFrameCount;
+@property (nonatomic, copy) NSString *lastNFCUID;
 @end
 
 @implementation JoyConPeripheralContext
@@ -81,10 +88,22 @@ static void FillJoyConVibrationMotorBlock(uint8_t *block, uint8_t counter, uint1
     }
 }
 
+static uint8_t JoyConMcuCRC8(const uint8_t *bytes, size_t length) {
+    uint8_t crc = 0;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= bytes[i];
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
 @implementation BLEManager {
     JoyConDataCallback _dataCallback;
     JoyConStatusCallback _statusCallback;
     JoyConTelemetryCallback _telemetryCallback;
+    JoyConNFCCallback _nfcCallback;
     NSMutableDictionary<NSString *, JoyConPeripheralContext *> *_contextsByPeripheralID;
     NSMutableDictionary<NSString *, NSNumber *> *_sideByPeripheralID;
     NSMutableDictionary<NSString *, NSNumber *> *_reconnectAttemptsByPeripheralID;
@@ -132,6 +151,10 @@ static void FillJoyConVibrationMotorBlock(uint8_t *block, uint8_t counter, uint1
 
 - (void)setTelemetryCallback:(JoyConTelemetryCallback)callback {
     _telemetryCallback = callback;
+}
+
+- (void)setNFCCallback:(JoyConNFCCallback)callback {
+    _nfcCallback = callback;
 }
 
 - (void)emitStatus:(const char *)status message:(const char *)message forContext:(JoyConPeripheralContext *)context {
@@ -458,6 +481,32 @@ static void FillJoyConVibrationMotorBlock(uint8_t *block, uint8_t counter, uint1
         return nil;
     }
     return [self keyForPeripheral:context.peripheral];
+}
+
+- (JoyConPeripheralContext *)contextForSide:(JoyConSide)side {
+    for (JoyConPeripheralContext *context in _contextsByPeripheralID.allValues) {
+        if (context.side == side &&
+            context.peripheral.state == CBPeripheralStateConnected &&
+            context.commandCharacteristic) {
+            return context;
+        }
+    }
+    return nil;
+}
+
+- (NSString *)compactHexForBytes:(const uint8_t *)bytes length:(NSUInteger)length {
+    if (!bytes || length == 0) {
+        return @"";
+    }
+    NSMutableString *hex = [NSMutableString stringWithCapacity:length * 2];
+    for (NSUInteger i = 0; i < length; i++) {
+        [hex appendFormat:@"%02X", bytes[i]];
+    }
+    return hex;
+}
+
+- (NSString *)compactHexForVector:(const std::vector<uint8_t>&)bytes {
+    return [self compactHexForBytes:bytes.data() length:bytes.size()];
 }
 
 - (void)queueInitializationForContext:(JoyConPeripheralContext *)context reason:(NSString *)reason {
@@ -1042,6 +1091,529 @@ waitsForProtocolResponse:NO
     return data;
 }
 
+- (NSData *)legacySubcommandReport:(uint8_t)subcommand
+                            payload:(const uint8_t *)payload
+                             length:(NSUInteger)payloadLength
+                          forContext:(JoyConPeripheralContext *)context {
+    uint8_t report[49] = {};
+    report[0] = 0x01;
+    report[1] = context.nfcOutputCounter & 0x0F;
+    context.nfcOutputCounter = (context.nfcOutputCounter + 1) & 0x0F;
+    report[10] = subcommand;
+
+    NSUInteger copyLength = std::min<NSUInteger>(payloadLength, 37);
+    if (payload && copyLength > 0) {
+        memcpy(&report[11], payload, copyLength);
+    }
+
+    if (subcommand == 0x21) {
+        report[48] = JoyConMcuCRC8(&report[12], 36);
+    }
+    return [NSData dataWithBytes:report length:sizeof(report)];
+}
+
+- (NSData *)legacyMcuReportWithFrame:(const uint8_t *)frame
+                               length:(NSUInteger)frameLength
+                            forContext:(JoyConPeripheralContext *)context {
+    uint8_t report[49] = {};
+    report[0] = 0x11;
+    report[1] = context.nfcOutputCounter & 0x0F;
+    context.nfcOutputCounter = (context.nfcOutputCounter + 1) & 0x0F;
+
+    NSUInteger copyLength = std::min<NSUInteger>(frameLength, 37);
+    if (frame && copyLength > 0) {
+        memcpy(&report[10], frame, copyLength);
+    }
+    report[47] = JoyConMcuCRC8(&report[11], 36);
+    report[48] = 0xFF;
+    return [NSData dataWithBytes:report length:sizeof(report)];
+}
+
+- (NSData *)switch2Command:(uint8_t)command
+                    marker:(uint8_t)marker
+                subcommand:(uint8_t)subcommand
+                   payload:(const uint8_t *)payload
+                    length:(NSUInteger)payloadLength {
+    uint8_t header[8] = {
+        command,
+        0x91,
+        marker,
+        subcommand,
+        0x00,
+        (uint8_t)(payloadLength & 0xFF),
+        (uint8_t)((payloadLength >> 8) & 0xFF),
+        0x00
+    };
+    NSMutableData *data = [NSMutableData dataWithBytes:header length:sizeof(header)];
+    if (payload && payloadLength > 0) {
+        [data appendBytes:payload length:payloadLength];
+    }
+    return data;
+}
+
+- (NSData *)switch2Command:(uint8_t)command
+                subcommand:(uint8_t)subcommand
+                   payload:(const uint8_t *)payload
+                    length:(NSUInteger)payloadLength {
+    return [self switch2Command:command
+                         marker:0x01
+                     subcommand:subcommand
+                        payload:payload
+                         length:payloadLength];
+}
+
+- (void)enqueueSwitch2NFCSubcommand:(uint8_t)subcommand
+                             payload:(const uint8_t *)payload
+                              length:(NSUInteger)payloadLength
+                               label:(NSString *)label
+                           forContext:(JoyConPeripheralContext *)context {
+    NSData *command = [self switch2Command:0x01
+                                subcommand:subcommand
+                                   payload:payload
+                                    length:payloadLength];
+    [self enqueueCommand:command
+                   label:label
+ waitsForProtocolResponse:YES
+               toContext:context];
+}
+
+- (void)enqueueSwitch2NFCSubcommand:(uint8_t)subcommand
+                              marker:(uint8_t)marker
+                             payload:(const uint8_t *)payload
+                              length:(NSUInteger)payloadLength
+                               label:(NSString *)label
+                           forContext:(JoyConPeripheralContext *)context {
+    NSData *command = [self switch2Command:0x01
+                                    marker:marker
+                                subcommand:subcommand
+                                   payload:payload
+                                    length:payloadLength];
+    [self enqueueCommand:command
+                   label:label
+ waitsForProtocolResponse:YES
+               toContext:context];
+}
+
+- (void)enqueueLegacySubcommand:(uint8_t)subcommand
+                        payload:(const uint8_t *)payload
+                         length:(NSUInteger)payloadLength
+                          label:(NSString *)label
+                      forContext:(JoyConPeripheralContext *)context {
+    NSData *report = [self legacySubcommandReport:subcommand
+                                          payload:payload
+                                           length:payloadLength
+                                       forContext:context];
+    [self enqueueCommand:report
+                   label:label
+waitsForProtocolResponse:NO
+               toContext:context];
+}
+
+- (void)enqueueLegacyMcuFrame:(const uint8_t *)frame
+                       length:(NSUInteger)frameLength
+                        label:(NSString *)label
+                    forContext:(JoyConPeripheralContext *)context {
+    NSData *report = [self legacyMcuReportWithFrame:frame
+                                             length:frameLength
+                                         forContext:context];
+    [self enqueueCommand:report
+                   label:label
+waitsForProtocolResponse:NO
+               toContext:context];
+}
+
+- (void)sendNFCPollForContext:(JoyConPeripheralContext *)context {
+    if (!context.nfcScanning ||
+        context.peripheral.state != CBPeripheralStateConnected ||
+        !context.commandCharacteristic) {
+        return;
+    }
+
+    static const uint8_t setupPayloadZero[] = {0x00, 0x00, 0x00, 0x2c, 0x01};
+    static const uint8_t readPayload[] = {0x00, 0x00};
+    [self enqueueSwitch2NFCSubcommand:0x03
+                               payload:setupPayloadZero
+                                length:sizeof(setupPayloadZero)
+                                 label:@"nfc arm reader"
+                             forContext:context];
+    [self enqueueSwitch2NFCSubcommand:0x05
+                               payload:nil
+                                length:0
+                                 label:@"nfc poll tag"
+                             forContext:context];
+    [self enqueueSwitch2NFCSubcommand:0x15
+                               payload:readPayload
+                                length:sizeof(readPayload)
+                                 label:@"nfc read tag"
+                             forContext:context];
+}
+
+- (BOOL)startNFCScanning {
+    JoyConPeripheralContext *context = [self contextForSide:JoyConSide::Right];
+    if (!context) {
+        [self emitTelemetry:"nfc.unavailable"
+                     detail:@"right Joy-Con command characteristic is not connected"
+                       side:JoyConSide::Right
+                       name:nil];
+        return NO;
+    }
+
+    if (context.nfcScanning) {
+        [self emitTelemetry:"nfc.alreadyScanning" detail:@"scan request ignored" forContext:context];
+        return YES;
+    }
+
+    context.nfcScanning = YES;
+    context.nfcOutputCounter = 0;
+    context.nfcFrameCount = 0;
+    context.lastNFCUID = nil;
+    [context.nfcPollTimer invalidate];
+    context.nfcPollTimer = nil;
+
+    [self emitTelemetry:"nfc.start"
+                 detail:@"right stick NFC touchpoint; using Switch 2 sidechannel NFC commands"
+             forContext:context];
+    [self emitStatus:"nfcScanning" message:"NFC scanning active" forContext:context];
+
+    static const uint8_t setupPayloadFast[] = {0x00, 0xe8, 0x03, 0x2c, 0x01};
+    static const uint8_t setupPayloadZero[] = {0x00, 0x00, 0x00, 0x2c, 0x01};
+    static const uint8_t activationPayload[] = {
+        0xd0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x03, 0x00, 0x3b, 0x3c, 0x77, 0x78,
+        0x86, 0x00, 0x00
+    };
+    static const uint8_t readPayload[] = {0x00, 0x00};
+
+    [self enqueueSwitch2NFCSubcommand:0x0C
+                               payload:nil
+                                length:0
+                                 label:@"nfc sidechannel status"
+                             forContext:context];
+    [self enqueueSwitch2NFCSubcommand:0x03
+                               payload:setupPayloadFast
+                                length:sizeof(setupPayloadFast)
+                                 label:@"nfc setup reader"
+                             forContext:context];
+    [self enqueueSwitch2NFCSubcommand:0x04
+                               payload:nil
+                                length:0
+                                 label:@"nfc setup commit"
+                             forContext:context];
+    [self enqueueSwitch2NFCSubcommand:0x06
+                               payload:activationPayload
+                                length:sizeof(activationPayload)
+                                 label:@"nfc activate reader"
+                             forContext:context];
+    [self enqueueSwitch2NFCSubcommand:0x03
+                               payload:setupPayloadZero
+                                length:sizeof(setupPayloadZero)
+                                 label:@"nfc arm reader"
+                             forContext:context];
+    [self enqueueSwitch2NFCSubcommand:0x05
+                               payload:nil
+                                length:0
+                                 label:@"nfc detect tag"
+                             forContext:context];
+    [self enqueueSwitch2NFCSubcommand:0x15
+                               payload:readPayload
+                                length:sizeof(readPayload)
+                                 label:@"nfc initial read"
+                             forContext:context];
+
+    __weak typeof(self) weakSelf = self;
+    __weak JoyConPeripheralContext *weakContext = context;
+    context.nfcPollTimer = [NSTimer scheduledTimerWithTimeInterval:0.50
+                                                           repeats:YES
+                                                             block:^(NSTimer * _Nonnull timer) {
+        (void)timer;
+        typeof(self) strongSelf = weakSelf;
+        JoyConPeripheralContext *strongContext = weakContext;
+        if (!strongSelf || !strongContext || !strongContext.nfcScanning) {
+            [timer invalidate];
+            return;
+        }
+        [strongSelf sendNFCPollForContext:strongContext];
+    }];
+    return YES;
+}
+
+- (BOOL)runNFCProtocolProbe {
+    JoyConPeripheralContext *context = [self contextForSide:JoyConSide::Right];
+    if (!context) {
+        [self emitTelemetry:"nfc.unavailable"
+                     detail:@"right Joy-Con command characteristic is not connected"
+                       side:JoyConSide::Right
+                       name:nil];
+        return NO;
+    }
+
+    context.nfcScanning = YES;
+    context.nfcOutputCounter = 0;
+    context.nfcFrameCount = 0;
+    context.lastNFCUID = nil;
+    [context.nfcPollTimer invalidate];
+    context.nfcPollTimer = nil;
+
+    [self emitTelemetry:"nfc.probe"
+                 detail:@"probing Switch 2 NFC sidechannel command variants"
+             forContext:context];
+    [self emitStatus:"nfcScanning" message:"NFC protocol probe active" forContext:context];
+
+    static const uint8_t setupPayloadFast[] = {0x00, 0xe8, 0x03, 0x2c, 0x01};
+    static const uint8_t setupPayloadZero[] = {0x00, 0x00, 0x00, 0x2c, 0x01};
+    static const uint8_t activationPayload[] = {
+        0xd0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x03, 0x00, 0x3b, 0x3c, 0x77, 0x78,
+        0x86, 0x00, 0x00
+    };
+    static const uint8_t readPayload[] = {0x00, 0x00};
+
+    const uint8_t markers[] = {0x01, 0x00};
+    for (uint8_t marker : markers) {
+        NSString *prefix = [NSString stringWithFormat:@"nfc probe marker%02X", marker];
+        [self enqueueSwitch2NFCSubcommand:0x0C
+                                    marker:marker
+                                   payload:nil
+                                    length:0
+                                     label:[prefix stringByAppendingString:@" status"]
+                                 forContext:context];
+        [self enqueueSwitch2NFCSubcommand:0x03
+                                    marker:marker
+                                   payload:setupPayloadFast
+                                    length:sizeof(setupPayloadFast)
+                                     label:[prefix stringByAppendingString:@" setup fast"]
+                                 forContext:context];
+        [self enqueueSwitch2NFCSubcommand:0x04
+                                    marker:marker
+                                   payload:nil
+                                    length:0
+                                     label:[prefix stringByAppendingString:@" setup ack"]
+                                 forContext:context];
+        [self enqueueSwitch2NFCSubcommand:0x05
+                                    marker:marker
+                                   payload:nil
+                                    length:0
+                                     label:[prefix stringByAppendingString:@" detect before"]
+                                 forContext:context];
+        [self enqueueSwitch2NFCSubcommand:0x06
+                                    marker:marker
+                                   payload:activationPayload
+                                    length:sizeof(activationPayload)
+                                     label:[prefix stringByAppendingString:@" activate"]
+                                 forContext:context];
+        [self enqueueSwitch2NFCSubcommand:0x15
+                                    marker:marker
+                                   payload:readPayload
+                                    length:sizeof(readPayload)
+                                     label:[prefix stringByAppendingString:@" read"]
+                                 forContext:context];
+        [self enqueueSwitch2NFCSubcommand:0x03
+                                    marker:marker
+                                   payload:setupPayloadZero
+                                    length:sizeof(setupPayloadZero)
+                                     label:[prefix stringByAppendingString:@" setup zero"]
+                                 forContext:context];
+        [self enqueueSwitch2NFCSubcommand:0x05
+                                    marker:marker
+                                   payload:nil
+                                    length:0
+                                     label:[prefix stringByAppendingString:@" detect after"]
+                                 forContext:context];
+        [self enqueueSwitch2NFCSubcommand:0x15
+                                    marker:marker
+                                   payload:readPayload
+                                    length:sizeof(readPayload)
+                                     label:[prefix stringByAppendingString:@" read after"]
+                                 forContext:context];
+    }
+    return YES;
+}
+
+- (void)stopNFCScanning {
+    JoyConPeripheralContext *context = [self contextForSide:JoyConSide::Right];
+    if (!context) {
+        return;
+    }
+    BOOL wasScanning = context.nfcScanning;
+    context.nfcScanning = NO;
+    context.lastNFCUID = nil;
+    [context.nfcPollTimer invalidate];
+    context.nfcPollTimer = nil;
+
+    if (!wasScanning) {
+        return;
+    }
+
+    [self emitTelemetry:"nfc.stop" detail:@"stopping Switch 2 sidechannel NFC polling" forContext:context];
+    [self emitStatus:"ready" message:"NFC scanning stopped" forContext:context];
+}
+
+- (BOOL)parseNFCRegion:(const uint8_t *)bytes
+                length:(NSUInteger)length
+               context:(JoyConPeripheralContext *)context {
+    if (!bytes || length < 10 || !context.nfcScanning) {
+        return NO;
+    }
+
+    context.nfcFrameCount += 1;
+    if (context.nfcFrameCount <= 10 || context.nfcFrameCount % 40 == 0) {
+        NSData *sample = [NSData dataWithBytes:bytes length:std::min<NSUInteger>(length, 96)];
+        [self emitTelemetry:"nfc.frame"
+                     detail:[NSString stringWithFormat:@"count=%lu length=%lu bytes=%@",
+                             (unsigned long)context.nfcFrameCount,
+                             (unsigned long)length,
+                             [self hexStringForData:sample maxBytes:96]]
+                 forContext:context];
+    }
+
+    for (NSUInteger i = 0; i + 5 < length; i++) {
+        uint8_t uidLength = bytes[i + 4];
+        BOOL plausibleHeader = bytes[i] == 0x01 &&
+                               bytes[i + 1] == 0x01 &&
+                               bytes[i + 3] == 0x00 &&
+                               (uidLength == 4 || uidLength == 7 || uidLength == 10);
+        if (!plausibleHeader || i + 5 + uidLength > length) {
+            continue;
+        }
+
+        const uint8_t *uidBytes = bytes + i + 5;
+        BOOL uidNonZero = NO;
+        for (uint8_t j = 0; j < uidLength; j++) {
+            if (uidBytes[j] != 0) {
+                uidNonZero = YES;
+                break;
+            }
+        }
+        if (!uidNonZero) {
+            continue;
+        }
+
+        std::vector<uint8_t> tagId(uidBytes, uidBytes + uidLength);
+        NSString *uid = [self compactHexForVector:tagId];
+        if ([uid isEqualToString:context.lastNFCUID]) {
+            return YES;
+        }
+
+        NSUInteger payloadLength = std::min<NSUInteger>(length, 192);
+        std::vector<uint8_t> payload(bytes, bytes + payloadLength);
+        uint8_t tagType = bytes[i + 2];
+        context.lastNFCUID = uid;
+
+        [self emitTelemetry:"nfc.tag"
+                     detail:[NSString stringWithFormat:@"uid=%@ type=0x%02X payloadLength=%lu",
+                             uid,
+                             tagType,
+                             (unsigned long)payload.size()]
+                 forContext:context];
+        if (_nfcCallback) {
+            _nfcCallback(1, tagType, tagId, payload);
+        }
+        return YES;
+    }
+
+    for (NSUInteger i = 0; i + 4 < length; i++) {
+        uint8_t uidLength = bytes[i + 3];
+        BOOL plausibleHeader = bytes[i] == 0x01 &&
+                               bytes[i + 1] == 0x02 &&
+                               bytes[i + 2] == 0x00 &&
+                               (uidLength == 4 || uidLength == 7 || uidLength == 10);
+        if (!plausibleHeader || i + 4 + uidLength > length) {
+            continue;
+        }
+
+        const uint8_t *uidBytes = bytes + i + 4;
+        BOOL uidNonZero = NO;
+        for (uint8_t j = 0; j < uidLength; j++) {
+            if (uidBytes[j] != 0) {
+                uidNonZero = YES;
+                break;
+            }
+        }
+        if (!uidNonZero) {
+            continue;
+        }
+
+        std::vector<uint8_t> tagId(uidBytes, uidBytes + uidLength);
+        NSString *uid = [self compactHexForVector:tagId];
+        if ([uid isEqualToString:context.lastNFCUID]) {
+            return YES;
+        }
+
+        NSUInteger payloadLength = std::min<NSUInteger>(length, 192);
+        std::vector<uint8_t> payload(bytes, bytes + payloadLength);
+        uint8_t tagType = bytes[i + 1];
+        context.lastNFCUID = uid;
+
+        [self emitTelemetry:"nfc.tag"
+                     detail:[NSString stringWithFormat:@"uid=%@ type=0x%02X payloadLength=%lu",
+                             uid,
+                             tagType,
+                             (unsigned long)payload.size()]
+                 forContext:context];
+        if (_nfcCallback) {
+            _nfcCallback(1, tagType, tagId, payload);
+        }
+        return YES;
+    }
+    return NO;
+}
+
+- (BOOL)handleNFCInputData:(NSData *)data forContext:(JoyConPeripheralContext *)context {
+    if (!data || !context.nfcScanning || context.side != JoyConSide::Right) {
+        return NO;
+    }
+
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    NSUInteger length = data.length;
+    BOOL looksLikeLargeMCUReport = length > 80 || (length > 0 && bytes[0] == 0x31);
+    if (!looksLikeLargeMCUReport) {
+        return NO;
+    }
+
+    BOOL found = NO;
+    if (length > 49 && bytes[0] == 0x31) {
+        found = [self parseNFCRegion:bytes + 49 length:length - 49 context:context];
+    }
+    if (!found) {
+        found = [self parseNFCRegion:bytes length:length context:context];
+    }
+    return looksLikeLargeMCUReport || found;
+}
+
+- (BOOL)handleNFCResponseData:(NSData *)data forContext:(JoyConPeripheralContext *)context {
+    if (!data || !context.nfcScanning || context.side != JoyConSide::Right) {
+        return NO;
+    }
+
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    NSUInteger length = data.length;
+    if (length < 8 || bytes[0] != 0x01) {
+        return NO;
+    }
+
+    uint8_t subcommand = bytes[3];
+    BOOL isNFCSetupResponse = subcommand == 0x03 ||
+                              subcommand == 0x04;
+    BOOL isNFCResponse = subcommand == 0x05 ||
+                         subcommand == 0x06 ||
+                         subcommand == 0x0C ||
+                         subcommand == 0x14 ||
+                         subcommand == 0x15;
+    if (!isNFCResponse && !isNFCSetupResponse) {
+        return NO;
+    }
+
+    NSData *sample = [NSData dataWithBytes:bytes length:std::min<NSUInteger>(length, 192)];
+    [self emitTelemetry:"nfc.response"
+                 detail:[NSString stringWithFormat:@"subcommand=0x%02X length=%lu bytes=%@",
+                         subcommand,
+                         (unsigned long)length,
+                         [self hexStringForData:sample maxBytes:192]]
+             forContext:context];
+
+    return [self parseNFCRegion:bytes length:length context:context] || isNFCResponse || isNFCSetupResponse;
+}
+
 #pragma mark - CBCentralManagerDelegate
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
@@ -1388,10 +1960,11 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic
     if ([characteristic isEqual:context.responseCharacteristic]) {
         std::cout << "[BLE] " << [[self labelForSide:context.side] UTF8String]
                   << " command response (" << data.length << " bytes)" << std::endl;
+        BOOL nfcResponse = [self handleNFCResponseData:data forContext:context];
         [self emitTelemetry:"command.response"
                      detail:[NSString stringWithFormat:@"length=%lu bytes=%@",
                              (unsigned long)data.length,
-                             [self hexStringForData:data maxBytes:24]]
+                             [self hexStringForData:data maxBytes:nfcResponse ? 192 : 24]]
                  forContext:context];
         if (context.waitingForResponse) {
             const uint8_t *responseBytes = (const uint8_t *)data.bytes;
@@ -1410,6 +1983,9 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic
 
     if ([characteristic isEqual:context.inputCharacteristic]) {
         const uint8_t *bytes = (const uint8_t *)data.bytes;
+        if ([self handleNFCInputData:data forContext:context]) {
+            return;
+        }
         std::vector<uint8_t> buffer(bytes, bytes + data.length);
         if (_dataCallback) {
             _dataCallback(buffer, context.side);

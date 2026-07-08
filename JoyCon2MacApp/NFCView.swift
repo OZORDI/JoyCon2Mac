@@ -20,6 +20,8 @@ struct NFCView: View {
                         isScanning.toggle()
                         if isScanning {
                             daemonBridge.scanNFC()
+                        } else {
+                            daemonBridge.stopNFC()
                         }
                     }) {
                         HStack {
@@ -59,7 +61,7 @@ struct NFCView: View {
                             .font(.title2)
                             .fontWeight(.semibold)
                         
-                        Text("Hold an NFC tag (like an Amiibo) near your Joy-Con and click Scan")
+                        Text("Hold an NFC tag near the right Joy-Con stick and click Scan")
                             .font(.body)
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
@@ -134,6 +136,12 @@ struct NFCView: View {
                 Spacer()
             }
             .padding()
+        }
+        .onDisappear {
+            if isScanning {
+                isScanning = false
+                daemonBridge.stopNFC()
+            }
         }
     }
     

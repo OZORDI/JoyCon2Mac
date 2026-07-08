@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <signal.h>
 
 // Global state for tracking controller data
@@ -236,6 +237,61 @@ void onJoyConTelemetry(JoyConSide side, const char *phase, const char *detail, c
         + "\"phase\":\"" + jsonEscape(phase) + "\","
         + "\"detail\":\"" + jsonEscape(detail) + "\","
         + "\"name\":\"" + jsonEscape(name) + "\""
+        + "}";
+    emitJSONLine(line);
+}
+
+static std::string hexCompact(const std::vector<uint8_t>& bytes) {
+    std::ostringstream out;
+    out << std::hex << std::uppercase << std::setfill('0');
+    for (uint8_t byte : bytes) {
+        out << std::setw(2) << static_cast<unsigned>(byte);
+    }
+    return out.str();
+}
+
+static const char *nfcTypeName(uint8_t tagType) {
+    switch (tagType) {
+        case 0x01: return "ISO14443A";
+        case 0x02: return "NTAG/Amiibo";
+        case 0x03: return "MIFARE";
+        case 0x04: return "NFC Tag";
+        default: return "Vendor";
+    }
+}
+
+void onJoyConNFCTag(uint8_t status,
+                    uint8_t tagType,
+                    const std::vector<uint8_t>& tagId,
+                    const std::vector<uint8_t>& payload) {
+    if (g_driverClient) {
+        JoyConNFCReportData report = {};
+        report.status = status;
+        size_t tagCopyLength = std::min<size_t>(tagId.size(), sizeof(report.tagId));
+        size_t payloadCopyLength = std::min<size_t>(payload.size(), sizeof(report.payload));
+        if (tagCopyLength > 0) {
+            memcpy(report.tagId, tagId.data(), tagCopyLength);
+        }
+        if (payloadCopyLength > 0) {
+            memcpy(report.payload, payload.data(), payloadCopyLength);
+        }
+        [g_driverClient postNFCReport:report];
+    }
+
+    if (!g_emitJSON) {
+        return;
+    }
+
+    std::string uidHex = hexCompact(tagId);
+    std::string payloadHex = hexCompact(payload);
+    std::string line = std::string("{")
+        + "\"event\":\"nfc\","
+        + "\"side\":\"right\","
+        + "\"status\":" + std::to_string(status) + ","
+        + "\"type\":\"" + jsonEscape(nfcTypeName(tagType)) + "\","
+        + "\"typeCode\":" + std::to_string(static_cast<unsigned>(tagType)) + ","
+        + "\"uid\":\"" + uidHex + "\","
+        + "\"payload\":\"" + payloadHex + "\""
         + "}";
     emitJSONLine(line);
 }
@@ -493,6 +549,25 @@ static void applyControlCommand(NSDictionary *command) {
         NSNumber *right = command[@"right"];
         if (![left isKindOfClass:[NSNumber class]] || ![right isKindOfClass:[NSNumber class]]) return;
         applyFindJoyConMode(left.boolValue, right.boolValue, "command");
+    } else if ([cmd isEqualToString:@"scanNFC"]) {
+        if (!g_bleManager) {
+            emitDaemonEvent("nfc", "scan failed: BLE manager missing");
+            return;
+        }
+        BOOL ok = [g_bleManager startNFCScanning];
+        emitDaemonEvent("nfc", ok ? "scan started" : "scan failed: right Joy-Con missing");
+    } else if ([cmd isEqualToString:@"probeNFC"]) {
+        if (!g_bleManager) {
+            emitDaemonEvent("nfc", "probe failed: BLE manager missing");
+            return;
+        }
+        BOOL ok = [g_bleManager runNFCProtocolProbe];
+        emitDaemonEvent("nfc", ok ? "probe started" : "probe failed: right Joy-Con missing");
+    } else if ([cmd isEqualToString:@"stopNFC"]) {
+        if (g_bleManager) {
+            [g_bleManager stopNFCScanning];
+        }
+        emitDaemonEvent("nfc", "scan stopped");
     } else if ([cmd isEqualToString:@"setRailBindings"]) {
         NSDictionary *bindings = command[@"bindings"];
         if (![bindings isKindOfClass:[NSDictionary class]]) return;
@@ -1117,6 +1192,7 @@ int main(int argc, const char * argv[]) {
         [bleManager setDataCallback:onJoyConData];
         [bleManager setStatusCallback:onJoyConStatus];
         [bleManager setTelemetryCallback:onJoyConTelemetry];
+        [bleManager setNFCCallback:onJoyConNFCTag];
         startRumblePolling();
         installShutdownHandler(SIGTERM);
         installShutdownHandler(SIGINT);

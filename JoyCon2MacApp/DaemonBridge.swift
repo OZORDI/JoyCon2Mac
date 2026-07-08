@@ -1023,7 +1023,13 @@ class DaemonBridge: ObservableObject {
     }
 
     func scanNFC() {
-        TelemetryStore.shared.append("NFC scan requested. Waiting for daemon NFC tag reports.")
+        TelemetryStore.shared.append("NFC scan requested on the right Joy-Con.")
+        sendControlCommand(["cmd": "scanNFC"])
+    }
+
+    func stopNFC() {
+        TelemetryStore.shared.append("NFC scan stopped.")
+        sendControlCommand(["cmd": "stopNFC"])
     }
 
     var telemetryLogPath: String {

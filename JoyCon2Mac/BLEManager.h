@@ -10,6 +10,7 @@
 using JoyConDataCallback = std::function<void(const std::vector<uint8_t>&, JoyConSide)>;
 using JoyConStatusCallback = std::function<void(JoyConSide, const char *, const char *, const char *)>;
 using JoyConTelemetryCallback = std::function<void(JoyConSide, const char *, const char *, const char *)>;
+using JoyConNFCCallback = std::function<void(uint8_t, uint8_t, const std::vector<uint8_t>&, const std::vector<uint8_t>&)>;
 
 @interface BLEManager : NSObject <CBCentralManagerDelegate, CBPeripheralDelegate>
 
@@ -20,6 +21,7 @@ using JoyConTelemetryCallback = std::function<void(JoyConSide, const char *, con
 - (void)setDataCallback:(JoyConDataCallback)callback;
 - (void)setStatusCallback:(JoyConStatusCallback)callback;
 - (void)setTelemetryCallback:(JoyConTelemetryCallback)callback;
+- (void)setNFCCallback:(JoyConNFCCallback)callback;
 
 // Control methods
 - (void)startScanning;
@@ -34,5 +36,8 @@ using JoyConTelemetryCallback = std::function<void(JoyConSide, const char *, con
 - (void)setRumbleLowFrequency:(uint8_t)lowFrequency highFrequency:(uint8_t)highFrequency;
 - (void)setFindModeLeft:(BOOL)leftActive right:(BOOL)rightActive;
 - (void)sendPairingPersistenceCommands;
+- (BOOL)startNFCScanning;
+- (BOOL)runNFCProtocolProbe;
+- (void)stopNFCScanning;
 
 @end
