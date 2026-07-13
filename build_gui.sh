@@ -85,6 +85,11 @@ swiftc \
     -o "$MACOS_DIR/JoyCon2Mac"
 
 codesign -s "$SIGN_IDENTITY" -f "$HELPER_APP" >/dev/null
-codesign -s "$SIGN_IDENTITY" -f --deep --generate-entitlement-der --entitlements "$APP_ENTITLEMENTS" "$APP_DIR" >/dev/null
+if [ "$SIGN_IDENTITY" = "-" ] && [ "${FORCE_ENTITLEMENTS:-0}" != "1" ]; then
+    echo "Ad-hoc signing: omitting restricted entitlements (set FORCE_ENTITLEMENTS=1 for SIP/AMFI-disabled dev machines)."
+    codesign -s "$SIGN_IDENTITY" -f --deep "$APP_DIR" >/dev/null
+else
+    codesign -s "$SIGN_IDENTITY" -f --deep --generate-entitlement-der --entitlements "$APP_ENTITLEMENTS" "$APP_DIR" >/dev/null
+fi
 
 echo "Built: $APP_DIR"

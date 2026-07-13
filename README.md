@@ -24,16 +24,48 @@ Do not treat this as a normal consumer install yet. Re-enable SIP/AMFI when you 
 
 ### Install From Release
 
-1. Download `JoyCon2Mac.app.zip` from the GitHub release.
-2. Unzip it.
-3. Move `JoyCon2Mac.app` to `/Applications`.
-4. Launch the app. If Gatekeeper blocks the first launch, right-click the app and choose `Open`.
-5. Approve the DriverKit extension in `System Settings -> Privacy & Security`.
-6. If macOS asks for a restart, restart.
-7. Open JoyCon2Mac again.
-8. Hold `SYNC` on each Joy-Con until the LEDs flash, then let the app connect.
+Existing releases were signed with the restricted system-extension entitlement, so on a stock Mac (SIP enabled) they do not launch at all — macOS reports `The application "JoyCon2Mac" can't be opened`. Right-click → `Open` does not help; the process is killed before Gatekeeper is even involved. Pick one of the two paths below.
 
-If the app opens but no controller or mouse appears in Chrome, SDL apps, or macOS, the system extension is probably not loaded or macOS blocked the unverified driver.
+#### Path A: app only, stock Mac (no driver — telemetry, battery, and gyro views work; gamepad and mouse do not)
+
+1. Download `JoyCon2Mac.app.zip` from the GitHub release and unzip it.
+2. Move `JoyCon2Mac.app` to `/Applications`.
+3. Strip the entitlement the release cannot use anyway:
+
+   ```bash
+   xattr -d com.apple.quarantine /Applications/JoyCon2Mac.app 2>/dev/null
+   codesign -s - -f /Applications/JoyCon2Mac.app
+   ```
+
+4. Launch the app.
+
+#### Path B: full functionality (driver development machine)
+
+The DriverKit extension is unsigned, so macOS will only load it with driver-development protections lowered. Do this only on a Mac you are comfortable using for driver development.
+
+1. Boot into Recovery (shut down, then hold the power button), open `Utilities -> Terminal`, and run:
+
+   ```bash
+   csrutil disable
+   nvram boot-args="amfi_get_out_of_my_way=1"
+   ```
+
+   Reboot back into macOS.
+2. Enable system-extension developer mode:
+
+   ```bash
+   systemextensionsctl developer on
+   ```
+
+3. Install `JoyCon2Mac.app` into `/Applications` (release zip as-is, or a local `FORCE_ENTITLEMENTS=1 ./build_all.sh` build).
+4. Launch the app and approve the DriverKit extension in `System Settings -> Privacy & Security`.
+5. If macOS asks for a restart, restart, then open JoyCon2Mac again.
+
+#### Pairing
+
+Hold `SYNC` on each Joy-Con until the LEDs flash, then let the app connect.
+
+If the app opens but no controller or mouse appears in Chrome, SDL apps, or macOS, the system extension is not loaded — check `systemextensionsctl list` and the Path B prerequisites.
 
 ### Build And Install Locally
 
@@ -47,6 +79,24 @@ open build/JoyCon2Mac.app
 ```text
 build/JoyCon2Mac.app/Contents/Library/SystemExtensions/
 ```
+
+Building requires full Xcode (the DriverKit SDK is not part of the Command Line Tools). If only a beta Xcode is installed, point the build at it:
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer ./build_all.sh
+```
+
+### Signing Modes
+
+Without `CODE_SIGN_IDENTITY`, builds are ad-hoc signed **without** the restricted `com.apple.developer.system-extension.install` entitlement — macOS kills ad-hoc apps that carry it at launch ("The application \"JoyCon2Mac\" can't be opened"), which is also why older releases refused to start on stock Macs. Such builds launch anywhere, but cannot activate the DriverKit extension, so only telemetry works.
+
+To get the full driver on a SIP/AMFI-disabled development machine, keep the entitlement:
+
+```bash
+FORCE_ENTITLEMENTS=1 ./build_all.sh
+```
+
+With a real signing identity (`CODE_SIGN_IDENTITY=...`), entitlements are always embedded.
 
 ## What Works
 
