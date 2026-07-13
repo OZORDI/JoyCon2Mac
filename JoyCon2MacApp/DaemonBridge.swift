@@ -84,12 +84,240 @@ enum MouseSource: Int {
     }
 }
 
-struct NFCTag: Identifiable {
-    let id = UUID()
+struct NFCDecodedRecord: Identifiable, Equatable {
+    var id: String { "\(label)\u{1f}\(value)" }
+    var label: String
+    var value: String
+}
+
+struct NFCTag: Identifiable, Equatable {
+    var id: String { uid }
     var uid: String
     var type: String
     var data: Data
-    var timestamp: Date
+    var firstSeen: Date
+    var lastSeen: Date
+    var scanCount: Int
+    var decodedRecords: [NFCDecodedRecord]
+    var readStatus: Int
+    var readMessage: String
+}
+
+enum NFCDecoder {
+    private static let uriPrefixes = [
+        "", "http://www.", "https://www.", "http://", "https://",
+        "tel:", "mailto:", "ftp://anonymous:anonymous@", "ftp://ftp.",
+        "ftps://", "sftp://", "smb://", "nfs://", "ftp://",
+        "dav://", "news:", "telnet://", "imap:", "rtsp://", "urn:",
+        "pop:", "sip:", "sips:", "tftp:", "btspp://", "btl2cap://",
+        "btgoep://", "tcpobex://", "irdaobex://", "file://",
+        "urn:epc:id:", "urn:epc:tag:", "urn:epc:pat:",
+        "urn:epc:raw:", "urn:epc:", "urn:nfc:"
+    ]
+
+    static func decode(_ data: Data) -> [NFCDecodedRecord] {
+        var records: [NFCDecodedRecord] = []
+
+        records.append(contentsOf: asciiURLs(in: data).map {
+            NFCDecodedRecord(label: "URL", value: $0)
+        })
+
+        records.append(contentsOf: decodeNDEFContainers(in: data))
+
+        var seen = Set<String>()
+        return records.filter { record in
+            let key = "\(record.label)\u{1f}\(record.value)"
+            return seen.insert(key).inserted
+        }
+    }
+
+    private static func decodeNDEFContainers(in data: Data) -> [NFCDecodedRecord] {
+        let bytes = Array(data)
+        var records: [NFCDecodedRecord] = []
+
+        for offset in bytes.indices {
+            records.append(contentsOf: decodeTLV(from: bytes, offset: offset))
+            records.append(contentsOf: decodeNDEFRecords(Array(bytes[offset...])))
+        }
+        return records
+    }
+
+    private static func decodeTLV(from bytes: [UInt8], offset: Int) -> [NFCDecodedRecord] {
+        var index = offset
+        var records: [NFCDecodedRecord] = []
+
+        while index < bytes.count {
+            let type = bytes[index]
+            index += 1
+
+            if type == 0x00 { continue }
+            if type == 0xFE { break }
+
+            guard index < bytes.count else { break }
+            var length = Int(bytes[index])
+            index += 1
+            if length == 0xFF {
+                guard index + 1 < bytes.count else { break }
+                length = (Int(bytes[index]) << 8) | Int(bytes[index + 1])
+                index += 2
+            }
+            guard length >= 0, index + length <= bytes.count else { break }
+
+            if type == 0x03 {
+                records.append(contentsOf: decodeNDEFRecords(Array(bytes[index..<index + length])))
+            }
+            index += length
+        }
+        return records
+    }
+
+    private static func decodeNDEFRecords(_ bytes: [UInt8]) -> [NFCDecodedRecord] {
+        var index = 0
+        var decoded: [NFCDecodedRecord] = []
+
+        while index < bytes.count {
+            let header = bytes[index]
+            index += 1
+
+            let messageBegin = (header & 0x80) != 0
+            let messageEnd = (header & 0x40) != 0
+            let shortRecord = (header & 0x10) != 0
+            let hasID = (header & 0x08) != 0
+            let tnf = header & 0x07
+
+            if !messageBegin || tnf == 0x00 {
+                break
+            }
+
+            guard index < bytes.count else { break }
+            let typeLength = Int(bytes[index])
+            index += 1
+
+            let payloadLength: Int
+            if shortRecord {
+                guard index < bytes.count else { break }
+                payloadLength = Int(bytes[index])
+                index += 1
+            } else {
+                guard index + 3 < bytes.count else { break }
+                payloadLength = (Int(bytes[index]) << 24) |
+                                (Int(bytes[index + 1]) << 16) |
+                                (Int(bytes[index + 2]) << 8) |
+                                Int(bytes[index + 3])
+                index += 4
+            }
+
+            let idLength: Int
+            if hasID {
+                guard index < bytes.count else { break }
+                idLength = Int(bytes[index])
+                index += 1
+            } else {
+                idLength = 0
+            }
+
+            guard typeLength >= 0,
+                  payloadLength >= 0,
+                  idLength >= 0,
+                  index + typeLength + idLength + payloadLength <= bytes.count else { break }
+
+            let typeData = Array(bytes[index..<index + typeLength])
+            index += typeLength + idLength
+            let payload = Array(bytes[index..<index + payloadLength])
+            index += payloadLength
+
+            decoded.append(contentsOf: decodeRecord(tnf: tnf, type: typeData, payload: payload))
+            if messageEnd { break }
+        }
+        return decoded
+    }
+
+    private static func decodeRecord(tnf: UInt8, type: [UInt8], payload: [UInt8]) -> [NFCDecodedRecord] {
+        guard !payload.isEmpty else { return [] }
+
+        if tnf == 0x01, type == [0x55] {
+            let prefixIndex = Int(payload[0])
+            let prefix = prefixIndex < uriPrefixes.count ? uriPrefixes[prefixIndex] : ""
+            let suffix = String(bytes: payload.dropFirst(), encoding: .utf8) ?? ""
+            guard !suffix.isEmpty else { return [] }
+            return [NFCDecodedRecord(label: "URL", value: prefix + suffix)]
+        }
+
+        if tnf == 0x01, type == [0x54] {
+            let status = payload[0]
+            let isUTF16 = (status & 0x80) != 0
+            let languageLength = Int(status & 0x3F)
+            guard payload.count > 1 + languageLength else { return [] }
+            let textBytes = payload.dropFirst(1 + languageLength)
+            let encoding: String.Encoding = isUTF16 ? .utf16BigEndian : .utf8
+            if let text = String(bytes: textBytes, encoding: encoding), !text.isEmpty {
+                return [NFCDecodedRecord(label: "Text", value: text)]
+            }
+        }
+
+        if tnf == 0x01, type == [0x53, 0x70] {
+            return decodeNDEFRecords(payload)
+        }
+
+        if tnf == 0x03, let uri = String(bytes: payload, encoding: .utf8), !uri.isEmpty {
+            return [NFCDecodedRecord(label: "URI", value: uri)]
+        }
+
+        return []
+    }
+
+    private static func asciiURLs(in data: Data) -> [String] {
+        guard let raw = String(data: data, encoding: .utf8) else { return [] }
+        let prefixes = ["https://", "http://", "www."]
+        var urls: [String] = []
+
+        for prefix in prefixes {
+            var searchStart = raw.startIndex
+            while let range = raw.range(of: prefix, range: searchStart..<raw.endIndex) {
+                var end = range.lowerBound
+                while end < raw.endIndex {
+                    let char = raw[end]
+                    if char.isWhitespace || char.unicodeScalars.contains(where: { $0.value < 0x20 }) {
+                        break
+                    }
+                    end = raw.index(after: end)
+                }
+                urls.append(String(raw[range.lowerBound..<end]))
+                searchStart = end
+            }
+        }
+        return urls
+    }
+
+    static func printableStrings(in data: Data) -> [NFCDecodedRecord] {
+        let bytes = Array(data)
+        var strings: [String] = []
+        var current: [UInt8] = []
+
+        func flush() {
+            guard current.count >= 4,
+                  let value = String(bytes: current, encoding: .utf8) else {
+                current.removeAll(keepingCapacity: true)
+                return
+            }
+            strings.append(value)
+            current.removeAll(keepingCapacity: true)
+        }
+
+        for byte in bytes {
+            if (0x20...0x7E).contains(byte) {
+                current.append(byte)
+            } else {
+                flush()
+            }
+        }
+        flush()
+
+        var seen = Set<String>()
+        return strings.filter { seen.insert($0).inserted }.map {
+            NFCDecodedRecord(label: "Text fragment", value: $0)
+        }
+    }
 }
 
 // Design notes (frozen-UI postmortem)
@@ -660,13 +888,51 @@ class DaemonBridge: ObservableObject {
         case "nfc":
             guard let uid = object["uid"] as? String else { return }
             let payloadHex = object["payload"] as? String ?? ""
-            let tag = NFCTag(
-                uid: uid,
-                type: object["type"] as? String ?? "Vendor",
-                data: dataFromHexString(payloadHex),
-                timestamp: Date()
-            )
-            DispatchQueue.main.async { [weak self] in self?.nfcTags.insert(tag, at: 0) }
+            let data = dataFromHexString(payloadHex)
+            let type = object["type"] as? String ?? "Vendor"
+            let readStatus = intValue(object["status"])
+            let readMessage: String
+            if readStatus == 0 {
+                readMessage = "Tag detected; reading"
+            } else if readStatus == 1 {
+                readMessage = "Read complete"
+            } else if data.count >= 2, data[data.startIndex] == 0x07, data[data.startIndex + 1] == 0x48 {
+                readMessage = "Detected, but not in the Amiibo format"
+            } else {
+                readMessage = "Read failed"
+            }
+            let timestamp = Date()
+            let decodedRecords = NFCDecoder.decode(data) + NFCDecoder.printableStrings(in: data)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let existingIndex = self.nfcTags.firstIndex(where: { $0.uid == uid }) {
+                    var tag = self.nfcTags.remove(at: existingIndex)
+                    tag.type = type
+                    tag.lastSeen = timestamp
+                    tag.readStatus = readStatus
+                    tag.readMessage = readMessage
+                    if readStatus == 0 {
+                        tag.scanCount += 1
+                    } else {
+                        tag.data = data
+                        tag.decodedRecords = decodedRecords
+                    }
+                    self.nfcTags.insert(tag, at: 0)
+                } else {
+                    let tag = NFCTag(
+                        uid: uid,
+                        type: type,
+                        data: data,
+                        firstSeen: timestamp,
+                        lastSeen: timestamp,
+                        scanCount: 1,
+                        decodedRecords: decodedRecords,
+                        readStatus: readStatus,
+                        readMessage: readMessage
+                    )
+                    self.nfcTags.insert(tag, at: 0)
+                }
+            }
         default:
             return
         }

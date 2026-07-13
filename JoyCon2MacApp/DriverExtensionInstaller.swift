@@ -5,16 +5,24 @@ import SystemExtensions
 final class DriverExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
     static let shared = DriverExtensionInstaller()
 
+    private typealias StatusHandler = (String, Bool) -> Void
+
     private let driverIdentifier = "local.joycon2mac.driver"
     private var currentRequest: OSSystemExtensionRequest?
-    private var statusHandler: ((String, Bool) -> Void)?
+    private var statusHandlers: [StatusHandler] = []
+    private var identicalReplacementWasCanceled = false
 
     private override init() {
         super.init()
     }
 
     func activate(status: @escaping (String, Bool) -> Void) {
-        statusHandler = status
+        statusHandlers.append(status)
+
+        guard currentRequest == nil else {
+            status("Driver extension activation is already in progress...", false)
+            return
+        }
 
         let request = OSSystemExtensionRequest.activationRequest(
             forExtensionWithIdentifier: driverIdentifier,
@@ -29,6 +37,8 @@ final class DriverExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate
 
     func request(_ request: OSSystemExtensionRequest,
                  didFinishWithResult result: OSSystemExtensionRequest.Result) {
+        guard request === currentRequest else { return }
+
         let detail: String
         switch result {
         case .completed:
@@ -38,51 +48,92 @@ final class DriverExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate
         @unknown default:
             detail = "Driver extension activation finished with result \(result.rawValue)."
         }
-        statusHandler?(detail, result == .completed)
-        currentRequest = nil
+        finish(detail, shouldRestartDaemon: result == .completed)
     }
 
     func request(_ request: OSSystemExtensionRequest,
                  didFailWithError error: Error) {
-        // The SystemExtensions framework returns .extensionNotFound (error 4)
-        // in several benign situations — most commonly when the app was
-        // relaunched while a prior version of the dext is still in the
-        // "terminating for upgrade" transition, or when the activation
-        // request raced an already-live driver. If the driver is in fact
-        // registered and matched in IOKit right now, treat the request as
-        // a no-op success instead of surfacing a scary error banner.
-        //
-        // We intentionally only apply this fallback on the specific error
-        // codes that SystemExtensions is known to emit for "already
-        // staged / replaced": .extensionNotFound (4) and .requestCanceled
-        // (8, fires when our own replace action supersedes a previous
-        // activation). For every other error we keep the original
-        // behaviour — the user really does need to know if signing,
-        // approval, or platform policy blocked the install.
-        let nsError = error as NSError
-        let isBenign = nsError.domain == "OSSystemExtensionErrorDomain"
-            && (nsError.code == OSSystemExtensionError.extensionNotFound.rawValue
-                || nsError.code == OSSystemExtensionError.requestCanceled.rawValue)
+        guard request === currentRequest else { return }
 
-        if isBenign, isDriverAlreadyLive() {
-            statusHandler?("Driver extension activated.", true)
-            currentRequest = nil
-            return
-        }
-
-        statusHandler?("Driver extension activation failed: \(error.localizedDescription)", false)
-        currentRequest = nil
+        // Driver publication and replacement are asynchronous. Reconcile the
+        // request error against IOKit for a short window before telling the UI
+        // that the driver itself failed to load.
+        reconcileFailure(error, attemptsRemaining: 10)
     }
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
-        statusHandler?("Driver extension is waiting for approval in System Settings.", false)
+        guard request === currentRequest else { return }
+        publish("Driver extension is waiting for approval in System Settings.", false)
     }
 
     func request(_ request: OSSystemExtensionRequest,
                  actionForReplacingExtension existing: OSSystemExtensionProperties,
                  withExtension ext: OSSystemExtensionProperties) -> OSSystemExtensionRequest.ReplacementAction {
-        statusHandler?("Replacing existing DriverKit extension with the bundled build...", false)
+        guard request === currentRequest else { return .cancel }
+
+        if existing.bundleVersion == ext.bundleVersion,
+           existing.bundleShortVersion == ext.bundleShortVersion {
+            identicalReplacementWasCanceled = true
+            publish("The bundled driver version is already installed.", false)
+            return .cancel
+        }
+
+        identicalReplacementWasCanceled = false
+        publish("Replacing existing DriverKit extension with the bundled build...", false)
         return .replace
+    }
+
+    private func reconcileFailure(_ error: Error, attemptsRemaining: Int) {
+        guard currentRequest != nil else { return }
+
+        if isDriverAlreadyLive() {
+            let nsError = error as NSError
+            let requestDidNotNeedActivation = identicalReplacementWasCanceled
+                || isExpectedAlreadyLoadedError(nsError)
+
+            if requestDidNotNeedActivation {
+                finish("Driver extension is loaded.", shouldRestartDaemon: true)
+            } else {
+                finish(
+                    "The existing driver is loaded, but the bundled update did not complete: \(error.localizedDescription)",
+                    shouldRestartDaemon: false
+                )
+            }
+            return
+        }
+
+        guard attemptsRemaining > 0 else {
+            finish(
+                "Driver extension activation failed: \(error.localizedDescription)",
+                shouldRestartDaemon: false
+            )
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.reconcileFailure(error, attemptsRemaining: attemptsRemaining - 1)
+        }
+    }
+
+    private func isExpectedAlreadyLoadedError(_ error: NSError) -> Bool {
+        guard error.domain == "OSSystemExtensionErrorDomain" else { return false }
+        return error.code == OSSystemExtensionError.extensionNotFound.rawValue
+            || error.code == OSSystemExtensionError.requestCanceled.rawValue
+            || error.code == OSSystemExtensionError.requestSuperseded.rawValue
+    }
+
+    private func publish(_ detail: String, _ shouldRestartDaemon: Bool) {
+        statusHandlers.forEach { $0(detail, shouldRestartDaemon) }
+    }
+
+    private func finish(_ detail: String, shouldRestartDaemon: Bool) {
+        let handlers = statusHandlers
+        statusHandlers.removeAll()
+        currentRequest = nil
+        identicalReplacementWasCanceled = false
+        for (index, handler) in handlers.enumerated() {
+            handler(detail, shouldRestartDaemon && index == handlers.startIndex)
+        }
     }
 
     // MARK: - IOKit probe

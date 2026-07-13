@@ -10,6 +10,21 @@ static NSString *const UUID_INPUT = @"ab7de9be-89fe-49ad-828f-118f09df7fd2";
 static NSString *const UUID_COMMAND = @"649d4ac9-8eb7-4e6c-af44-1ea54fe5f005";
 static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
 
+typedef NS_ENUM(NSInteger, JoyConNFCPhase) {
+    JoyConNFCPhaseIdle = 0,
+    JoyConNFCPhaseEnteringScan,
+    JoyConNFCPhaseWaitingForTag,
+    JoyConNFCPhaseStartingRead,
+    JoyConNFCPhaseWaitingForReadReady,
+    JoyConNFCPhaseReadingBuffer,
+    JoyConNFCPhaseWaitingForRemoval,
+    JoyConNFCPhaseError,
+};
+
+static const NSUInteger kJoyConNFCReadPayloadLength = 622;
+static const NSUInteger kJoyConNFCReadMetadataLength = 63;
+static const NSUInteger kJoyConNFCRawTagLength = 540;
+
 @interface JoyConPeripheralContext : NSObject
 @property (nonatomic, strong) CBPeripheral *peripheral;
 @property (nonatomic, strong) CBCharacteristic *inputCharacteristic;
@@ -43,6 +58,13 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
 @property (nonatomic, assign) uint8_t nfcOutputCounter;
 @property (nonatomic, assign) NSUInteger nfcFrameCount;
 @property (nonatomic, copy) NSString *lastNFCUID;
+@property (nonatomic, assign) JoyConNFCPhase nfcPhase;
+@property (nonatomic, strong) NSMutableData *nfcReadBuffer;
+@property (nonatomic, strong) NSData *nfcTagID;
+@property (nonatomic, assign) uint8_t nfcTagType;
+@property (nonatomic, assign) NSUInteger nfcRequestedOffset;
+@property (nonatomic, assign) NSUInteger nfcStatusPollCount;
+@property (nonatomic, assign) BOOL nfcRequireRemoval;
 @end
 
 @implementation JoyConPeripheralContext
@@ -53,6 +75,8 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
         _commandLabels = [NSMutableArray array];
         _commandWaitsForProtocolResponse = [NSMutableArray array];
         _imuAllZeroLastSeen = YES;
+        _nfcPhase = JoyConNFCPhaseIdle;
+        _nfcReadBuffer = [NSMutableData data];
     }
     return self;
 }
@@ -1156,7 +1180,7 @@ waitsForProtocolResponse:NO
                    payload:(const uint8_t *)payload
                     length:(NSUInteger)payloadLength {
     return [self switch2Command:command
-                         marker:0x01
+                         marker:0x00
                      subcommand:subcommand
                         payload:payload
                          length:payloadLength];
@@ -1222,30 +1246,163 @@ waitsForProtocolResponse:NO
                toContext:context];
 }
 
-- (void)sendNFCPollForContext:(JoyConPeripheralContext *)context {
-    if (!context.nfcScanning ||
-        context.peripheral.state != CBPeripheralStateConnected ||
-        !context.commandCharacteristic) {
+- (void)resetNFCReadStateForContext:(JoyConPeripheralContext *)context {
+    context.nfcRequestedOffset = 0;
+    context.nfcStatusPollCount = 0;
+    [context.nfcReadBuffer setLength:0];
+    context.nfcTagID = nil;
+    context.nfcTagType = 0;
+}
+
+- (void)enqueueNFCEnterScanForContext:(JoyConPeripheralContext *)context {
+    if (!context.nfcScanning) {
         return;
     }
-
-    static const uint8_t setupPayloadZero[] = {0x00, 0x00, 0x00, 0x2c, 0x01};
-    static const uint8_t readPayload[] = {0x00, 0x00};
+    static const uint8_t setupPayload[] = {0x00, 0xe8, 0x03, 0x2c, 0x01};
+    context.nfcPhase = JoyConNFCPhaseEnteringScan;
     [self enqueueSwitch2NFCSubcommand:0x03
-                               payload:setupPayloadZero
-                                length:sizeof(setupPayloadZero)
-                                 label:@"nfc arm reader"
+                                marker:0x00
+                               payload:setupPayload
+                                length:sizeof(setupPayload)
+                                 label:@"nfc enter scan"
                              forContext:context];
+}
+
+- (void)enqueueNFCStatusForContext:(JoyConPeripheralContext *)context {
+    if (!context.nfcScanning || context.commandInFlight) {
+        return;
+    }
+    context.nfcStatusPollCount += 1;
     [self enqueueSwitch2NFCSubcommand:0x05
+                                marker:0x00
                                payload:nil
                                 length:0
-                                 label:@"nfc poll tag"
+                                 label:@"nfc get status"
                              forContext:context];
+}
+
+- (void)scheduleNFCStatusForContext:(JoyConPeripheralContext *)context delay:(NSTimeInterval)delay {
+    [context.nfcPollTimer invalidate];
+    if (!context.nfcScanning) {
+        context.nfcPollTimer = nil;
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    __weak JoyConPeripheralContext *weakContext = context;
+    context.nfcPollTimer = [NSTimer scheduledTimerWithTimeInterval:delay
+                                                           repeats:NO
+                                                             block:^(NSTimer * _Nonnull timer) {
+        (void)timer;
+        typeof(self) strongSelf = weakSelf;
+        JoyConPeripheralContext *strongContext = weakContext;
+        if (!strongSelf || !strongContext || !strongContext.nfcScanning) {
+            return;
+        }
+        strongContext.nfcPollTimer = nil;
+        [strongSelf enqueueNFCStatusForContext:strongContext];
+    }];
+}
+
+- (void)enqueueNFCReadOperationForContext:(JoyConPeripheralContext *)context {
+    static const uint8_t readDescriptor[] = {
+        0xd0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x03, 0x00, 0x3b, 0x3c, 0x77, 0x78,
+        0x86, 0x00, 0x00
+    };
+    context.nfcPhase = JoyConNFCPhaseStartingRead;
+    [context.nfcReadBuffer setLength:0];
+    context.nfcRequestedOffset = 0;
+    [self enqueueSwitch2NFCSubcommand:0x06
+                                marker:0x00
+                               payload:readDescriptor
+                                length:sizeof(readDescriptor)
+                                 label:@"nfc begin Amiibo read"
+                             forContext:context];
+}
+
+- (void)enqueueNFCReadBufferForContext:(JoyConPeripheralContext *)context {
+    if (!context.nfcScanning || context.nfcReadBuffer.length >= kJoyConNFCReadPayloadLength) {
+        return;
+    }
+    uint16_t offset = (uint16_t)context.nfcReadBuffer.length;
+    uint8_t payload[] = {
+        (uint8_t)(offset & 0xff),
+        (uint8_t)((offset >> 8) & 0xff)
+    };
+    context.nfcRequestedOffset = offset;
+    context.nfcPhase = JoyConNFCPhaseReadingBuffer;
     [self enqueueSwitch2NFCSubcommand:0x15
-                               payload:readPayload
-                                length:sizeof(readPayload)
-                                 label:@"nfc read tag"
+                                marker:0x01
+                               payload:payload
+                                length:sizeof(payload)
+                                 label:[NSString stringWithFormat:@"nfc read buffer offset=%u", (unsigned)offset]
                              forContext:context];
+}
+
+- (void)leaveNFCTransactionForContext:(JoyConPeripheralContext *)context requireRemoval:(BOOL)requireRemoval {
+    if (!context.nfcScanning) {
+        return;
+    }
+    context.nfcRequireRemoval = requireRemoval;
+    context.nfcPhase = JoyConNFCPhaseWaitingForRemoval;
+    [self enqueueSwitch2NFCSubcommand:0x04
+                                marker:0x00
+                               payload:nil
+                                length:0
+                                 label:@"nfc leave scan"
+                             forContext:context];
+}
+
+- (void)emitNFCTagStatus:(uint8_t)status
+                  detail:(uint8_t)detail
+              forContext:(JoyConPeripheralContext *)context {
+    if (!_nfcCallback || !context.nfcTagID) {
+        return;
+    }
+    const uint8_t *uidBytes = (const uint8_t *)context.nfcTagID.bytes;
+    std::vector<uint8_t> tagId(uidBytes, uidBytes + context.nfcTagID.length);
+    std::vector<uint8_t> payload = {status, detail};
+    _nfcCallback(2, context.nfcTagType, tagId, payload);
+}
+
+- (BOOL)validateAndPublishNFCReadForContext:(JoyConPeripheralContext *)context {
+    if (context.nfcReadBuffer.length != kJoyConNFCReadPayloadLength || !context.nfcTagID) {
+        return NO;
+    }
+
+    const uint8_t *payload = (const uint8_t *)context.nfcReadBuffer.bytes;
+    BOOL validEnvelope = payload[0] == 0x01 && payload[1] == 0x58 && payload[2] == 0x02;
+    const uint8_t *raw = payload + kJoyConNFCReadMetadataLength;
+    uint8_t bcc0 = (uint8_t)(0x88 ^ raw[0] ^ raw[1] ^ raw[2]);
+    uint8_t bcc1 = (uint8_t)(raw[4] ^ raw[5] ^ raw[6] ^ raw[7]);
+    BOOL validTag = raw[3] == bcc0 && raw[8] == bcc1 &&
+                    raw[12] == 0xe1 && raw[14] == 0x3e;
+
+    uint8_t rawUID[] = {raw[0], raw[1], raw[2], raw[4], raw[5], raw[6], raw[7]};
+    BOOL uidMatches = context.nfcTagID.length == sizeof(rawUID) &&
+                      memcmp(context.nfcTagID.bytes, rawUID, sizeof(rawUID)) == 0;
+    if (!validEnvelope || !validTag || !uidMatches) {
+        [self emitTelemetry:"nfc.readInvalid"
+                     detail:[NSString stringWithFormat:@"envelope=%d tag=%d uid=%d bytes=%lu",
+                             validEnvelope, validTag, uidMatches,
+                             (unsigned long)context.nfcReadBuffer.length]
+                 forContext:context];
+        [self emitNFCTagStatus:0x07 detail:0x48 forContext:context];
+        return NO;
+    }
+
+    std::vector<uint8_t> tagId(rawUID, rawUID + sizeof(rawUID));
+    std::vector<uint8_t> rawTag(raw, raw + kJoyConNFCRawTagLength);
+    [self emitTelemetry:"nfc.readComplete"
+                 detail:[NSString stringWithFormat:@"uid=%@ rawBytes=%lu transferBytes=%lu",
+                         context.lastNFCUID ?: @"",
+                         (unsigned long)rawTag.size(),
+                         (unsigned long)context.nfcReadBuffer.length]
+             forContext:context];
+    if (_nfcCallback) {
+        _nfcCallback(1, context.nfcTagType, tagId, rawTag);
+    }
+    return YES;
 }
 
 - (BOOL)startNFCScanning {
@@ -1267,166 +1424,28 @@ waitsForProtocolResponse:NO
     context.nfcOutputCounter = 0;
     context.nfcFrameCount = 0;
     context.lastNFCUID = nil;
+    context.nfcRequireRemoval = NO;
     [context.nfcPollTimer invalidate];
     context.nfcPollTimer = nil;
+    [self resetNFCReadStateForContext:context];
 
     [self emitTelemetry:"nfc.start"
                  detail:@"right stick NFC touchpoint; using Switch 2 sidechannel NFC commands"
              forContext:context];
     [self emitStatus:"nfcScanning" message:"NFC scanning active" forContext:context];
 
-    static const uint8_t setupPayloadFast[] = {0x00, 0xe8, 0x03, 0x2c, 0x01};
-    static const uint8_t setupPayloadZero[] = {0x00, 0x00, 0x00, 0x2c, 0x01};
-    static const uint8_t activationPayload[] = {
-        0xd0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x01, 0x03, 0x00, 0x3b, 0x3c, 0x77, 0x78,
-        0x86, 0x00, 0x00
-    };
-    static const uint8_t readPayload[] = {0x00, 0x00};
-
-    [self enqueueSwitch2NFCSubcommand:0x0C
-                               payload:nil
-                                length:0
-                                 label:@"nfc sidechannel status"
-                             forContext:context];
-    [self enqueueSwitch2NFCSubcommand:0x03
-                               payload:setupPayloadFast
-                                length:sizeof(setupPayloadFast)
-                                 label:@"nfc setup reader"
-                             forContext:context];
-    [self enqueueSwitch2NFCSubcommand:0x04
-                               payload:nil
-                                length:0
-                                 label:@"nfc setup commit"
-                             forContext:context];
-    [self enqueueSwitch2NFCSubcommand:0x06
-                               payload:activationPayload
-                                length:sizeof(activationPayload)
-                                 label:@"nfc activate reader"
-                             forContext:context];
-    [self enqueueSwitch2NFCSubcommand:0x03
-                               payload:setupPayloadZero
-                                length:sizeof(setupPayloadZero)
-                                 label:@"nfc arm reader"
-                             forContext:context];
-    [self enqueueSwitch2NFCSubcommand:0x05
-                               payload:nil
-                                length:0
-                                 label:@"nfc detect tag"
-                             forContext:context];
-    [self enqueueSwitch2NFCSubcommand:0x15
-                               payload:readPayload
-                                length:sizeof(readPayload)
-                                 label:@"nfc initial read"
-                             forContext:context];
-
-    __weak typeof(self) weakSelf = self;
-    __weak JoyConPeripheralContext *weakContext = context;
-    context.nfcPollTimer = [NSTimer scheduledTimerWithTimeInterval:0.50
-                                                           repeats:YES
-                                                             block:^(NSTimer * _Nonnull timer) {
-        (void)timer;
-        typeof(self) strongSelf = weakSelf;
-        JoyConPeripheralContext *strongContext = weakContext;
-        if (!strongSelf || !strongContext || !strongContext.nfcScanning) {
-            [timer invalidate];
-            return;
-        }
-        [strongSelf sendNFCPollForContext:strongContext];
-    }];
+    [self enqueueNFCEnterScanForContext:context];
     return YES;
 }
 
 - (BOOL)runNFCProtocolProbe {
     JoyConPeripheralContext *context = [self contextForSide:JoyConSide::Right];
-    if (!context) {
-        [self emitTelemetry:"nfc.unavailable"
-                     detail:@"right Joy-Con command characteristic is not connected"
-                       side:JoyConSide::Right
-                       name:nil];
-        return NO;
+    if (context) {
+        [self emitTelemetry:"nfc.probe"
+                     detail:@"using the marker-correct state machine; unsafe marker permutations removed"
+                 forContext:context];
     }
-
-    context.nfcScanning = YES;
-    context.nfcOutputCounter = 0;
-    context.nfcFrameCount = 0;
-    context.lastNFCUID = nil;
-    [context.nfcPollTimer invalidate];
-    context.nfcPollTimer = nil;
-
-    [self emitTelemetry:"nfc.probe"
-                 detail:@"probing Switch 2 NFC sidechannel command variants"
-             forContext:context];
-    [self emitStatus:"nfcScanning" message:"NFC protocol probe active" forContext:context];
-
-    static const uint8_t setupPayloadFast[] = {0x00, 0xe8, 0x03, 0x2c, 0x01};
-    static const uint8_t setupPayloadZero[] = {0x00, 0x00, 0x00, 0x2c, 0x01};
-    static const uint8_t activationPayload[] = {
-        0xd0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x01, 0x03, 0x00, 0x3b, 0x3c, 0x77, 0x78,
-        0x86, 0x00, 0x00
-    };
-    static const uint8_t readPayload[] = {0x00, 0x00};
-
-    const uint8_t markers[] = {0x01, 0x00};
-    for (uint8_t marker : markers) {
-        NSString *prefix = [NSString stringWithFormat:@"nfc probe marker%02X", marker];
-        [self enqueueSwitch2NFCSubcommand:0x0C
-                                    marker:marker
-                                   payload:nil
-                                    length:0
-                                     label:[prefix stringByAppendingString:@" status"]
-                                 forContext:context];
-        [self enqueueSwitch2NFCSubcommand:0x03
-                                    marker:marker
-                                   payload:setupPayloadFast
-                                    length:sizeof(setupPayloadFast)
-                                     label:[prefix stringByAppendingString:@" setup fast"]
-                                 forContext:context];
-        [self enqueueSwitch2NFCSubcommand:0x04
-                                    marker:marker
-                                   payload:nil
-                                    length:0
-                                     label:[prefix stringByAppendingString:@" setup ack"]
-                                 forContext:context];
-        [self enqueueSwitch2NFCSubcommand:0x05
-                                    marker:marker
-                                   payload:nil
-                                    length:0
-                                     label:[prefix stringByAppendingString:@" detect before"]
-                                 forContext:context];
-        [self enqueueSwitch2NFCSubcommand:0x06
-                                    marker:marker
-                                   payload:activationPayload
-                                    length:sizeof(activationPayload)
-                                     label:[prefix stringByAppendingString:@" activate"]
-                                 forContext:context];
-        [self enqueueSwitch2NFCSubcommand:0x15
-                                    marker:marker
-                                   payload:readPayload
-                                    length:sizeof(readPayload)
-                                     label:[prefix stringByAppendingString:@" read"]
-                                 forContext:context];
-        [self enqueueSwitch2NFCSubcommand:0x03
-                                    marker:marker
-                                   payload:setupPayloadZero
-                                    length:sizeof(setupPayloadZero)
-                                     label:[prefix stringByAppendingString:@" setup zero"]
-                                 forContext:context];
-        [self enqueueSwitch2NFCSubcommand:0x05
-                                    marker:marker
-                                   payload:nil
-                                    length:0
-                                     label:[prefix stringByAppendingString:@" detect after"]
-                                 forContext:context];
-        [self enqueueSwitch2NFCSubcommand:0x15
-                                    marker:marker
-                                   payload:readPayload
-                                    length:sizeof(readPayload)
-                                     label:[prefix stringByAppendingString:@" read after"]
-                                 forContext:context];
-    }
-    return YES;
+    return [self startNFCScanning];
 }
 
 - (void)stopNFCScanning {
@@ -1436,15 +1455,24 @@ waitsForProtocolResponse:NO
     }
     BOOL wasScanning = context.nfcScanning;
     context.nfcScanning = NO;
+    context.nfcPhase = JoyConNFCPhaseIdle;
+    context.nfcRequireRemoval = NO;
     context.lastNFCUID = nil;
     [context.nfcPollTimer invalidate];
     context.nfcPollTimer = nil;
+    [self resetNFCReadStateForContext:context];
 
     if (!wasScanning) {
         return;
     }
 
-    [self emitTelemetry:"nfc.stop" detail:@"stopping Switch 2 sidechannel NFC polling" forContext:context];
+    [self emitTelemetry:"nfc.stop" detail:@"stopping Switch 2 NFC transaction state machine" forContext:context];
+    [self enqueueSwitch2NFCSubcommand:0x04
+                                marker:0x00
+                               payload:nil
+                                length:0
+                                 label:@"nfc deactivate reader"
+                             forContext:context];
     [self emitStatus:"ready" message:"NFC scanning stopped" forContext:context];
 }
 
@@ -1611,7 +1639,184 @@ waitsForProtocolResponse:NO
                          [self hexStringForData:sample maxBytes:192]]
              forContext:context];
 
-    return [self parseNFCRegion:bytes length:length context:context] || isNFCResponse || isNFCSetupResponse;
+    BOOL commandAccepted = bytes[1] == 0x01;
+    if (!commandAccepted) {
+        [self emitTelemetry:"nfc.commandRejected"
+                     detail:[NSString stringWithFormat:@"subcommand=0x%02X direction=0x%02X expected=0x01",
+                             subcommand, bytes[1]]
+                 forContext:context];
+        if (subcommand == 0x15) {
+            [self emitNFCTagStatus:0x07 detail:0x4a forContext:context];
+            [self leaveNFCTransactionForContext:context requireRemoval:YES];
+        } else {
+            [self scheduleNFCStatusForContext:context delay:0.20];
+        }
+        return YES;
+    }
+
+    if (subcommand == 0x03) {
+        context.nfcPhase = context.nfcRequireRemoval
+            ? JoyConNFCPhaseWaitingForRemoval
+            : JoyConNFCPhaseWaitingForTag;
+        [self scheduleNFCStatusForContext:context delay:0.04];
+        return YES;
+    }
+
+    if (subcommand == 0x04) {
+        if (context.nfcScanning) {
+            __weak typeof(self) weakSelf = self;
+            __weak JoyConPeripheralContext *weakContext = context;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                typeof(self) strongSelf = weakSelf;
+                JoyConPeripheralContext *strongContext = weakContext;
+                if (strongSelf && strongContext && strongContext.nfcScanning) {
+                    [strongSelf enqueueNFCEnterScanForContext:strongContext];
+                }
+            });
+        }
+        return YES;
+    }
+
+    if (subcommand == 0x06) {
+        context.nfcPhase = JoyConNFCPhaseWaitingForReadReady;
+        [self scheduleNFCStatusForContext:context delay:0.04];
+        return YES;
+    }
+
+    if (subcommand == 0x05) {
+        if (length < 10) {
+            [self scheduleNFCStatusForContext:context delay:0.20];
+            return YES;
+        }
+
+        uint8_t nfcState = bytes[8];
+        uint8_t nfcDetail = bytes[9];
+        [self emitTelemetry:"nfc.state"
+                     detail:[NSString stringWithFormat:@"state=0x%02X detail=0x%02X phase=%ld poll=%lu",
+                             nfcState, nfcDetail, (long)context.nfcPhase,
+                             (unsigned long)context.nfcStatusPollCount]
+                 forContext:context];
+
+        if (nfcState == 0x09) {
+            if (length < 17) {
+                [self scheduleNFCStatusForContext:context delay:0.20];
+                return YES;
+            }
+            uint8_t uidLength = bytes[16];
+            if ((uidLength != 4 && uidLength != 7 && uidLength != 10) || 17 + uidLength > length) {
+                [self emitTelemetry:"nfc.invalidIdentity"
+                             detail:[NSString stringWithFormat:@"uidLength=%u responseLength=%lu",
+                                     uidLength, (unsigned long)length]
+                         forContext:context];
+                [self scheduleNFCStatusForContext:context delay:0.20];
+                return YES;
+            }
+
+            NSData *tagID = [NSData dataWithBytes:bytes + 17 length:uidLength];
+            const uint8_t *tagIDBytes = (const uint8_t *)tagID.bytes;
+            std::vector<uint8_t> tagIDVector(tagIDBytes, tagIDBytes + tagID.length);
+            NSString *uid = [self compactHexForVector:tagIDVector];
+            if (context.nfcRequireRemoval && [uid isEqualToString:context.lastNFCUID]) {
+                [self scheduleNFCStatusForContext:context delay:0.15];
+                return YES;
+            }
+
+            context.nfcTagID = tagID;
+            context.nfcTagType = bytes[14];
+            context.lastNFCUID = uid;
+            context.nfcRequireRemoval = NO;
+            context.nfcStatusPollCount = 0;
+            [context.nfcReadBuffer setLength:0];
+            [self emitTelemetry:"nfc.tagDetected"
+                         detail:[NSString stringWithFormat:@"uid=%@ type=0x%02X",
+                                 uid, context.nfcTagType]
+                     forContext:context];
+            if (_nfcCallback) {
+                std::vector<uint8_t> emptyPayload;
+                _nfcCallback(0, context.nfcTagType, tagIDVector, emptyPayload);
+            }
+            [self enqueueNFCReadOperationForContext:context];
+            return YES;
+        }
+
+        if (nfcState == 0x04) {
+            if (context.nfcTagID) {
+                [self enqueueNFCReadBufferForContext:context];
+            } else {
+                [self leaveNFCTransactionForContext:context requireRemoval:NO];
+            }
+            return YES;
+        }
+
+        if (nfcState == 0x07) {
+            if (nfcDetail == 0x41) {
+                if (context.nfcRequireRemoval) {
+                    context.nfcRequireRemoval = NO;
+                    context.lastNFCUID = nil;
+                    [self resetNFCReadStateForContext:context];
+                }
+                context.nfcPhase = JoyConNFCPhaseWaitingForTag;
+                [self scheduleNFCStatusForContext:context delay:0.25];
+            } else {
+                context.nfcPhase = JoyConNFCPhaseError;
+                [self emitNFCTagStatus:nfcState detail:nfcDetail forContext:context];
+                [self emitStatus:"nfcTagRejected"
+                          message:nfcDetail == 0x48
+                              ? "Tag detected, but it is not in the Amiibo format"
+                              : "NFC tag read failed"
+                       forContext:context];
+                [self leaveNFCTransactionForContext:context requireRemoval:YES];
+            }
+            return YES;
+        }
+
+        [self scheduleNFCStatusForContext:context delay:0.10];
+        return YES;
+    }
+
+    if (subcommand == 0x15) {
+        if (length < 12 || bytes[8] != 0x00) {
+            [self emitNFCTagStatus:0x07 detail:0x3e forContext:context];
+            [self leaveNFCTransactionForContext:context requireRemoval:YES];
+            return YES;
+        }
+
+        uint16_t responseOffset = (uint16_t)(bytes[9] | ((uint16_t)bytes[10] << 8));
+        if (responseOffset != context.nfcRequestedOffset || responseOffset != context.nfcReadBuffer.length) {
+            [self emitTelemetry:"nfc.offsetMismatch"
+                         detail:[NSString stringWithFormat:@"requested=%lu response=%u assembled=%lu",
+                                 (unsigned long)context.nfcRequestedOffset,
+                                 (unsigned)responseOffset,
+                                 (unsigned long)context.nfcReadBuffer.length]
+                     forContext:context];
+            [self emitNFCTagStatus:0x07 detail:0x4a forContext:context];
+            [self leaveNFCTransactionForContext:context requireRemoval:YES];
+            return YES;
+        }
+
+        NSUInteger available = length - 11;
+        NSUInteger remaining = kJoyConNFCReadPayloadLength - context.nfcReadBuffer.length;
+        NSUInteger appendLength = MIN(available, remaining);
+        [context.nfcReadBuffer appendBytes:bytes + 11 length:appendLength];
+        [self emitTelemetry:"nfc.buffer"
+                     detail:[NSString stringWithFormat:@"offset=%u chunk=%lu assembled=%lu/%lu",
+                             (unsigned)responseOffset,
+                             (unsigned long)appendLength,
+                             (unsigned long)context.nfcReadBuffer.length,
+                             (unsigned long)kJoyConNFCReadPayloadLength]
+                 forContext:context];
+
+        if (context.nfcReadBuffer.length < kJoyConNFCReadPayloadLength) {
+            [self enqueueNFCReadBufferForContext:context];
+        } else {
+            [self validateAndPublishNFCReadForContext:context];
+            [self leaveNFCTransactionForContext:context requireRemoval:YES];
+        }
+        return YES;
+    }
+
+    return isNFCResponse || isNFCSetupResponse;
 }
 
 #pragma mark - CBCentralManagerDelegate
