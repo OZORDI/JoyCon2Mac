@@ -183,9 +183,9 @@ struct SettingsView: View {
                         .foregroundColor(.secondary)
                 }
                 
-                Link("GitHub Repository", destination: URL(string: "https://github.com/yourusername/joycon2mac")!)
+                Link("GitHub Repository", destination: URL(string: "https://github.com/OZORDI/JoyCon2Mac")!)
                 
-                Link("Report Issue", destination: URL(string: "https://github.com/yourusername/joycon2mac/issues")!)
+                Link("Report Issue", destination: URL(string: "https://github.com/OZORDI/JoyCon2Mac/issues/new")!)
             }
         }
         .formStyle(.grouped)
