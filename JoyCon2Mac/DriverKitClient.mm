@@ -149,6 +149,17 @@ static io_service_t copyVirtualJoyConService(void) {
     }
 }
 
+- (void)postKeyboardReport:(struct JoyConKeyboardReportData)report {
+    if (!_isRunning || _connection == IO_OBJECT_NULL) return;
+
+    size_t outputSize = 0;
+    kern_return_t ret = IOConnectCallStructMethod(_connection, 5, &report, sizeof(report), NULL, &outputSize);
+    if (ret != KERN_SUCCESS) {
+        static int errorCount = 0;
+        if (errorCount++ % 120 == 0) NSLog(@"[DriverKitClient] Failed to post keyboard report: 0x%x", ret);
+    }
+}
+
 - (void)postNFCReport:(struct JoyConNFCReportData)report {
     if (!_isRunning || _connection == IO_OBJECT_NULL) return;
     

@@ -221,6 +221,13 @@ cat > "$DEXT_CONTENTS/Info.plist" <<PLIST
                     <key>IOUserClass</key>
                     <string>VirtualJoyConMouseDevice</string>
                 </dict>
+                <key>KeyboardDeviceProperties</key>
+                <dict>
+                    <key>IOClass</key>
+                    <string>AppleUserHIDDevice</string>
+                    <key>IOUserClass</key>
+                    <string>VirtualJoyConKeyboardDevice</string>
+                </dict>
             </dict>
         </dict>
     </dict>

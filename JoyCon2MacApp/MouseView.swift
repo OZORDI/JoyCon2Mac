@@ -3,15 +3,6 @@ import SwiftUI
 struct MouseView: View {
     @EnvironmentObject var daemonBridge: DaemonBridge
 
-    // UI-only sliders. These are cosmetic — the daemon hard-codes the
-    // joycon2cpp sensitivity values (1.0 / 0.6 / 0.3). Keeping them here
-    // so the settings screen doesn't look empty; they aren't wired to the
-    // daemon yet.
-    @State private var slowSensitivity: Double = 0.3
-    @State private var normalSensitivity: Double = 0.6
-    @State private var fastSensitivity: Double = 1.0
-    @State private var scrollSpeed: Double = 1.0
-
     private var leftController: ControllerState? {
         daemonBridge.controllers.first(where: { $0.side == "left" })
     }
@@ -31,6 +22,27 @@ struct MouseView: View {
     private var activeSide: String {
         daemonBridge.controllers.first?.mouseActiveSide ?? "right"
     }
+    private var pointerMethod: PointerMethod {
+        daemonBridge.controllers.first?.pointerMethod ?? .optical
+    }
+    private var gyroSource: GyroMouseSource {
+        daemonBridge.controllers.first?.gyroMouseSource ?? .fused
+    }
+    private var gyroEnabled: Bool {
+        daemonBridge.controllers.first?.gyroAimingEnabled ?? false
+    }
+    private var gyroCalibrating: Bool {
+        daemonBridge.controllers.first?.gyroCalibrating ?? true
+    }
+    private var gyroActiveSource: String {
+        daemonBridge.controllers.first?.gyroActiveSource ?? "none"
+    }
+    private var leftToggleBinding: GyroToggleBinding {
+        daemonBridge.controllers.first?.leftGyroToggleBinding ?? .capture
+    }
+    private var rightToggleBinding: GyroToggleBinding {
+        daemonBridge.controllers.first?.rightGyroToggleBinding ?? .chat
+    }
 
     var body: some View {
         ScrollView {
@@ -38,13 +50,17 @@ struct MouseView: View {
                 header
 
                 Divider()
+                pointerMethodPicker
+
+                Divider()
                 modePicker
 
                 Divider()
-                sourcePicker
-
-                Divider()
-                sensitivitySliders
+                if pointerMethod == .optical {
+                    sourcePicker
+                } else {
+                    gyroAimingControls
+                }
 
                 Divider()
                 buttonMapping
@@ -66,15 +82,36 @@ struct MouseView: View {
 
             Spacer()
 
-            Button(action: {
-                daemonBridge.toggleMouseMode()
-            }) {
-                HStack {
-                    Image(systemName: "computermouse.fill")
-                    Text("Cycle Mode")
+            Button {
+                if pointerMethod == .gyroAiming {
+                    daemonBridge.setGyroAimingEnabled(!gyroEnabled)
+                } else {
+                    daemonBridge.toggleMouseMode()
                 }
+            } label: {
+                Label(pointerMethod == .gyroAiming
+                      ? (gyroEnabled ? "Stop Aiming" : "Start Aiming")
+                      : "Cycle Mode",
+                      systemImage: pointerMethod == .gyroAiming
+                      ? (gyroEnabled ? "stop.fill" : "scope")
+                      : "computermouse.fill")
             }
             .buttonStyle(.bordered)
+        }
+    }
+
+    private var pointerMethodPicker: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Pointer Input")
+                .font(.headline)
+            Picker("Pointer Input", selection: Binding<PointerMethod>(
+                get: { pointerMethod },
+                set: { daemonBridge.setPointerMethod($0) }
+            )) {
+                Text("Optical").tag(PointerMethod.optical)
+                Text("Gyro Aiming").tag(PointerMethod.gyroAiming)
+            }
+            .pickerStyle(.segmented)
         }
     }
 
@@ -97,10 +134,90 @@ struct MouseView: View {
             }
             .pickerStyle(.segmented)
 
-            Text("Press Chat (C) on the Right Joy-Con to cycle modes, or use the segmented control above.")
+            Text(pointerMethod == .optical
+                 ? "Press Chat (C) on the Right Joy-Con to cycle modes."
+                 : "The selected preset controls free-air pointer speed.")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
+    }
+
+    private var gyroAimingControls: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Gyro Source")
+                    .font(.headline)
+                Spacer()
+                Label(gyroStatusText, systemImage: gyroStatusIcon)
+                    .font(.caption)
+                    .foregroundColor(gyroEnabled ? .green : .secondary)
+            }
+
+            Picker("Gyro Source", selection: Binding<GyroMouseSource>(
+                get: { gyroSource },
+                set: { daemonBridge.setGyroMouseSource($0) }
+            )) {
+                Text("Fused").tag(GyroMouseSource.fused)
+                Text("Left Joy-Con").tag(GyroMouseSource.left)
+                Text("Right Joy-Con").tag(GyroMouseSource.right)
+            }
+            .pickerStyle(.segmented)
+
+            HStack(spacing: 12) {
+                Button {
+                    daemonBridge.setGyroAimingEnabled(!gyroEnabled)
+                } label: {
+                    Label(gyroEnabled ? "Stop" : "Start",
+                          systemImage: gyroEnabled ? "stop.fill" : "scope")
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button {
+                    daemonBridge.calibrateGyroPointer()
+                } label: {
+                    Label("Calibrate", systemImage: "scope")
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Text("Hold the selected Joy-Con still while calibrating. Rotation moves the pointer; stopping rotation stops it.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Activation Buttons")
+                    .font(.subheadline.weight(.semibold))
+                HStack(spacing: 18) {
+                    Picker("Left", selection: Binding<GyroToggleBinding>(
+                        get: { leftToggleBinding },
+                        set: { daemonBridge.setGyroToggleBindings(left: $0, right: rightToggleBinding) }
+                    )) {
+                        ForEach(GyroToggleBinding.leftChoices) { binding in
+                            Text(binding.label).tag(binding)
+                        }
+                    }
+                    Picker("Right", selection: Binding<GyroToggleBinding>(
+                        get: { rightToggleBinding },
+                        set: { daemonBridge.setGyroToggleBindings(left: leftToggleBinding, right: $0) }
+                    )) {
+                        ForEach(GyroToggleBinding.rightChoices) { binding in
+                            Text(binding.label).tag(binding)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var gyroStatusText: String {
+        if gyroCalibrating { return "Calibrating" }
+        if gyroEnabled { return "Active: \(gyroActiveSource.capitalized)" }
+        return "Ready"
+    }
+
+    private var gyroStatusIcon: String {
+        if gyroCalibrating { return "circle.dotted" }
+        return gyroEnabled ? "scope" : "pause.circle"
     }
 
     private var sourcePicker: some View {
@@ -131,6 +248,10 @@ struct MouseView: View {
             .pickerStyle(.segmented)
 
             Text("Auto picks whichever Joy-Con is resting on a surface (distance == 0). Switch sides any time without unpairing — the optical baseline resets on every switch so the cursor won't jump.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            Text("Hold L + ZL or R + ZR on the active optical Joy-Con while moving it to invoke system swipes: left/right changes Spaces, up opens Mission Control, and down opens App Expose.")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
@@ -171,28 +292,6 @@ struct MouseView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    private var sensitivitySliders: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text("Sensitivity (UI only — daemon uses joycon2cpp presets)")
-                .font(.headline)
-
-            VStack(alignment: .leading, spacing: 8) {
-                sliderRow(label: "Slow Mode",   value: $slowSensitivity,   range: 0.1...1.0)
-                sliderRow(label: "Normal Mode", value: $normalSensitivity, range: 0.1...2.0)
-                sliderRow(label: "Fast Mode",   value: $fastSensitivity,   range: 0.5...3.0)
-                sliderRow(label: "Scroll Speed",value: $scrollSpeed,       range: 0.5...3.0)
-            }
-        }
-    }
-
-    private func sliderRow(label: String, value: Binding<Double>, range: ClosedRange<Double>) -> some View {
-        HStack {
-            Text(label).frame(width: 110, alignment: .leading)
-            Slider(value: value, in: range, step: 0.1)
-            Text("\(value.wrappedValue, specifier: "%.1f")x").frame(width: 50, alignment: .trailing)
-        }
-    }
-
     private var buttonMapping: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Button Mapping")
@@ -202,12 +301,22 @@ struct MouseView: View {
                 // Mapping depends on which side is the active mouse.
                 // joycon2cpp's right layout: R = Left-click, ZR = Right-click, R3 = Middle-click.
                 // Matching left layout: L = Left, ZL = Right, L3 = Middle.
-                let isLeftMouse = activeSide == "left"
-                mappingRow(from: isLeftMouse ? "L"   : "R",   to: "Left Click")
-                mappingRow(from: isLeftMouse ? "ZL"  : "ZR",  to: "Right Click")
-                mappingRow(from: isLeftMouse ? "L3"  : "R3",  to: "Middle Click")
-                mappingRow(from: "Joystick Y", to: "Scroll Wheel")
-                mappingRow(from: "Joystick X ± edge", to: "Forward / Back")
+                if pointerMethod == .gyroAiming && gyroSource == .fused {
+                    mappingRow(from: "L / R", to: "Left Click")
+                    mappingRow(from: "ZL / ZR", to: "Right Click")
+                    mappingRow(from: "L3 / R3", to: "Middle Click")
+                } else {
+                    let isLeftMouse = pointerMethod == .gyroAiming
+                        ? gyroSource == .left
+                        : activeSide == "left"
+                    mappingRow(from: isLeftMouse ? "L" : "R", to: "Left Click")
+                    mappingRow(from: isLeftMouse ? "ZL" : "ZR", to: "Right Click")
+                    mappingRow(from: isLeftMouse ? "L3" : "R3", to: "Middle Click")
+                    if pointerMethod == .optical {
+                        mappingRow(from: "Joystick Y", to: "Scroll Wheel")
+                        mappingRow(from: "Joystick X ± edge", to: "Forward / Back")
+                    }
+                }
             }
         }
     }
@@ -230,10 +339,17 @@ struct MouseView: View {
                     .fill(Color(NSColor.controlBackgroundColor))
                     .frame(height: 200)
 
-                // Show the ACTIVE side's optical readout, not just
-                // controllers.first which was previously pinned to Left.
-                let active = activeSide == "left" ? leftController : rightController
-                if let c = active {
+                if pointerMethod == .gyroAiming {
+                    VStack(spacing: 10) {
+                        Image(systemName: "scope")
+                            .font(.system(size: 34))
+                        Text(gyroEnabled ? "Gyro pointer active" : "Gyro pointer paused")
+                            .font(.headline)
+                        Text("Source: \(gyroActiveSource.capitalized)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                } else if let c = activeSide == "left" ? leftController : rightController {
                     VStack(spacing: 8) {
                         Text("Optical Sensor · \(activeSide.capitalized)")
                             .font(.caption)

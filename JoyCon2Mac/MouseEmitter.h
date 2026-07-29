@@ -2,6 +2,7 @@
 #define MOUSE_EMITTER_H
 
 #import <Foundation/Foundation.h>
+#import <dispatch/dispatch.h>
 #import "DriverKitClient.h"
 #include "JoyConDecoder.h"
 
@@ -26,15 +27,73 @@ typedef NS_ENUM(NSInteger, MouseSource) {
     MouseSourceRight = 2
 };
 
-@interface MouseEmitter : NSObject
+typedef NS_ENUM(NSInteger, PointerMethod) {
+    PointerMethodOptical = 0,
+    PointerMethodGyro    = 1
+};
+
+typedef NS_ENUM(NSInteger, GyroMouseSource) {
+    GyroMouseSourceFused = 0,
+    GyroMouseSourceLeft  = 1,
+    GyroMouseSourceRight = 2
+};
+
+struct GyroPointerSample {
+    MotionData motion = {0, 0, 0, 0, 0, 0};
+    double timestamp = 0;
+    float biasX = 0;
+    float biasY = 0;
+    float biasZ = 0;
+    double stationaryStart = 0;
+    double sumX = 0;
+    double sumY = 0;
+    double sumZ = 0;
+    uint32_t stationarySamples = 0;
+    bool valid = false;
+    bool biasValid = false;
+    bool manualPending = false;
+    bool surfaceKnown = false;
+    bool onSurface = false;
+    bool rearmPending = false;
+    double rearmStillStart = 0;
+};
+
+@interface MouseEmitter : NSObject {
+@private
+    GyroPointerSample _gyroLeft;
+    GyroPointerSample _gyroRight;
+    dispatch_source_t _gyroTimer;
+    double _gyroLastTick;
+    double _gyroFractionX;
+    double _gyroFractionY;
+    BOOL _gyroTogglePressedLeft;
+    BOOL _gyroTogglePressedRight;
+    uint32_t _gyroButtonStateLeft;
+    uint32_t _gyroButtonStateRight;
+    double _gyroButtonTimestampLeft;
+    double _gyroButtonTimestampRight;
+    NSString *_gyroActiveSourceName;
+    BOOL _gyroCalibrating;
+    BOOL _opticalGestureChordActive;
+    BOOL _opticalGestureTriggered;
+    double _opticalGestureX;
+    double _opticalGestureY;
+}
 
 @property (nonatomic, assign) MouseMode currentMode;
 @property (nonatomic, assign) MouseSource source;
+@property (nonatomic, assign) PointerMethod pointerMethod;
+@property (nonatomic, assign) GyroMouseSource gyroSource;
+@property (nonatomic, assign, getter=isGyroAimingEnabled) BOOL gyroAimingEnabled;
+@property (nonatomic, copy) NSString *leftGyroToggleBinding;
+@property (nonatomic, copy) NSString *rightGyroToggleBinding;
 @property (nonatomic, assign) DriverKitClient *driverClient;
 
 // The side the last optical sample was actually consumed from. Exposed so
 // main.mm can emit it as telemetry (the GUI shows "Active: Left/Right").
 @property (nonatomic, readonly, assign) JoyConSide lastActiveSide;
+@property (nonatomic, readonly, copy) NSString *gyroActiveSourceName;
+@property (nonatomic, readonly, assign, getter=isGyroCalibrating) BOOL gyroCalibrating;
 
 - (instancetype)initWithDriverClient:(DriverKitClient *)client;
 
@@ -54,6 +113,16 @@ typedef NS_ENUM(NSInteger, MouseSource) {
           buttonState:(uint32_t)btnState
          stickReading:(StickData)stickData
         mouseDistance:(uint16_t)mouseDistance;
+
+// Feed the latest per-side IMU and buttons into the free-air pointer path.
+// Returns the physical button bit consumed as the gyro activation toggle,
+// or zero when no gamepad button needs suppressing.
+- (uint32_t)processGyroMotion:(MotionData)motion
+                         side:(JoyConSide)side
+                  buttonState:(uint32_t)buttonState;
+
+- (void)requestGyroCalibration;
+- (void)resetGyroAiming;
 
 // True when mouse mode is enabled and this side is the current on-surface
 // mouse owner. The gamepad path uses this to remove that Joy-Con from the

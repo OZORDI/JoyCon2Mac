@@ -87,6 +87,8 @@ static std::string g_railBindingLeftSL = "none";
 static std::string g_railBindingLeftSR = "none";
 static std::string g_railBindingRightSL = "none";
 static std::string g_railBindingRightSR = "none";
+static uint32_t g_gyroConsumedLeft = 0;
+static uint32_t g_gyroConsumedRight = 0;
 
 // Write one formatted debug-input line to stderr AND (if opened) to the
 // mirror file so you can just `tail -f` the file without wrangling the
@@ -210,6 +212,11 @@ static std::string jsonEscape(const char *value) {
 }
 
 void onJoyConStatus(JoyConSide side, const char *status, const char *message, const char *name) {
+    if (status && std::strcmp(status, "disconnected") == 0 && g_mouseEmitter) {
+        [g_mouseEmitter resetGyroAiming];
+        if (side == JoyConSide::Left) g_gyroConsumedLeft = 0;
+        else g_gyroConsumedRight = 0;
+    }
     if (!g_emitJSON) {
         return;
     }
@@ -540,6 +547,47 @@ static void applyControlCommand(NSDictionary *command) {
         emitDaemonEvent("mouseSource",
                         [[NSString stringWithFormat:@"applied=%s (%d)", srcName, raw] UTF8String]);
         std::cout << "[Control] Mouse source set to " << srcName << std::endl;
+    } else if ([cmd isEqualToString:@"setPointerMethod"]) {
+        if (!g_mouseEmitter) return;
+        NSNumber *value = command[@"value"];
+        if (![value isKindOfClass:[NSNumber class]]) return;
+        int raw = value.intValue;
+        if (raw < 0 || raw > 1) return;
+        g_mouseEmitter.pointerMethod = (PointerMethod)raw;
+        emitDaemonEvent("pointerMethod",
+                        [[NSString stringWithFormat:@"applied=%d", raw] UTF8String]);
+    } else if ([cmd isEqualToString:@"setGyroMouseSource"]) {
+        if (!g_mouseEmitter) return;
+        NSNumber *value = command[@"value"];
+        if (![value isKindOfClass:[NSNumber class]]) return;
+        int raw = value.intValue;
+        if (raw < 0 || raw > 2) return;
+        g_mouseEmitter.gyroSource = (GyroMouseSource)raw;
+        emitDaemonEvent("gyroMouseSource",
+                        [[NSString stringWithFormat:@"applied=%d", raw] UTF8String]);
+    } else if ([cmd isEqualToString:@"setGyroAimingEnabled"]) {
+        if (!g_mouseEmitter) return;
+        NSNumber *value = command[@"value"];
+        if (![value isKindOfClass:[NSNumber class]]) return;
+        g_mouseEmitter.gyroAimingEnabled = value.boolValue;
+        emitDaemonEvent("gyroAiming", value.boolValue ? "enabled=1" : "enabled=0");
+    } else if ([cmd isEqualToString:@"calibrateGyro"]) {
+        if (!g_mouseEmitter) return;
+        [g_mouseEmitter requestGyroCalibration];
+        emitDaemonEvent("gyroCalibration", "requested=1");
+    } else if ([cmd isEqualToString:@"setGyroToggleBindings"]) {
+        if (!g_mouseEmitter) return;
+        NSString *left = command[@"left"];
+        NSString *right = command[@"right"];
+        NSSet *leftAllowed = [NSSet setWithArray:@[@"capture", @"minus", @"sl", @"sr", @"stick"]];
+        NSSet *rightAllowed = [NSSet setWithArray:@[@"chat", @"home", @"plus", @"sl", @"sr", @"stick"]];
+        if ([left isKindOfClass:[NSString class]] && [leftAllowed containsObject:left]) {
+            g_mouseEmitter.leftGyroToggleBinding = left;
+        }
+        if ([right isKindOfClass:[NSString class]] && [rightAllowed containsObject:right]) {
+            g_mouseEmitter.rightGyroToggleBinding = right;
+        }
+        emitDaemonEvent("gyroToggleBindings", "applied=1");
     } else if ([cmd isEqualToString:@"setSDLOnlyMode"]) {
         NSNumber *value = command[@"value"];
         if (![value isKindOfClass:[NSNumber class]]) return;
@@ -806,6 +854,13 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
     int mouseMode = g_mouseEmitter ? (int)g_mouseEmitter.currentMode : 0;
     int mouseSource = g_mouseEmitter ? (int)g_mouseEmitter.source : 0;
     const char *mouseActive = g_mouseEmitter && g_mouseEmitter.lastActiveSide == JoyConSide::Left ? "left" : "right";
+    int pointerMethod = g_mouseEmitter ? (int)g_mouseEmitter.pointerMethod : 0;
+    int gyroMouseSource = g_mouseEmitter ? (int)g_mouseEmitter.gyroSource : 0;
+    bool gyroAimingEnabled = g_mouseEmitter && g_mouseEmitter.isGyroAimingEnabled;
+    bool gyroCalibrating = g_mouseEmitter && g_mouseEmitter.isGyroCalibrating;
+    const char *gyroActiveSource = g_mouseEmitter ? [g_mouseEmitter.gyroActiveSourceName UTF8String] : "none";
+    const char *leftGyroToggle = g_mouseEmitter ? [g_mouseEmitter.leftGyroToggleBinding UTF8String] : "capture";
+    const char *rightGyroToggle = g_mouseEmitter ? [g_mouseEmitter.rightGyroToggleBinding UTF8String] : "chat";
 
     std::ostringstream out;
     out << "{"
@@ -839,7 +894,14 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
         << "\"triggerR\":" << (int)g_state.triggerR << ","
         << "\"mouseMode\":" << mouseMode << ","
         << "\"mouseSource\":" << mouseSource << ","
-        << "\"mouseActiveSide\":\"" << mouseActive << "\""
+        << "\"mouseActiveSide\":\"" << mouseActive << "\","
+        << "\"pointerMethod\":" << pointerMethod << ","
+        << "\"gyroMouseSource\":" << gyroMouseSource << ","
+        << "\"gyroAimingEnabled\":" << (gyroAimingEnabled ? "true" : "false") << ","
+        << "\"gyroCalibrating\":" << (gyroCalibrating ? "true" : "false") << ","
+        << "\"gyroActiveSource\":\"" << gyroActiveSource << "\","
+        << "\"leftGyroToggleBinding\":\"" << leftGyroToggle << "\","
+        << "\"rightGyroToggleBinding\":\"" << rightGyroToggle << "\""
         << "}";
     emitJSONLine(out.str());
 }
@@ -903,6 +965,12 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         g_state.mouseRight  = DecodeMouse(buffer);
         g_state.mouse       = g_state.mouseRight;
     }
+    MotionData sideMotion = side == JoyConSide::Left ? g_state.motionLeft : g_state.motionRight;
+    uint32_t gyroConsumedMask = g_mouseEmitter
+        ? [g_mouseEmitter processGyroMotion:sideMotion side:side buttonState:sideButtons]
+        : 0;
+    if (side == JoyConSide::Left) g_gyroConsumedLeft = gyroConsumedMask;
+    else g_gyroConsumedRight = gyroConsumedMask;
     g_state.battery = DecodeBattery(buffer);
     auto triggers = DecodeAnalogTriggers(buffer);
     // Only update the trigger for the side that sent this packet.
@@ -918,7 +986,8 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     // joycon2cpp: only the Right Joy-Con / Joy-Con 2 has a Chat (C) button,
     // and that button is the *only* trigger for mouse mode. On the left
     // Joy-Con we do nothing here — Capture remains a normal gamepad button.
-    if (side == JoyConSide::Right) {
+    if (side == JoyConSide::Right
+        && (!g_mouseEmitter || g_mouseEmitter.pointerMethod == PointerMethodOptical)) {
         static bool wasChatPressed = false;
         bool chatPressed = (sideButtons & 0x000040) != 0;
         if (chatPressed && !wasChatPressed) {
@@ -944,6 +1013,7 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     StickData sideStickForGamepad  = (side == JoyConSide::Right)
                                         ? g_state.rightStick
                                         : g_state.leftStick;
+    sideButtonsForGamepad &= ~gyroConsumedMask;
 
     // Always feed the emitter — even when mouse mode is Off — so it can
     // keep its per-side surface tracking up to date and drive the "Active"
@@ -977,6 +1047,8 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         StickData rightStickForReport  = g_state.rightStick;
         uint8_t triggerLForReport = g_state.triggerL;
         uint8_t triggerRForReport = g_state.triggerR;
+        leftButtonsForReport &= ~g_gyroConsumedLeft;
+        rightButtonsForReport &= ~g_gyroConsumedRight;
         if (side == JoyConSide::Left) {
             leftButtonsForReport = sideButtonsForGamepad;
             leftStickForReport   = sideStickForGamepad;

@@ -22,6 +22,12 @@ struct JoyConMouseReportData {
     int8_t scroll;
 };
 
+struct JoyConKeyboardReportData {
+    uint8_t modifiers;
+    uint8_t reserved;
+    uint8_t keys[6];
+};
+
 struct JoyConNFCReportData {
     uint8_t status;
     uint8_t tagId[7];
@@ -51,6 +57,7 @@ struct JoyConHIDModeData {
 
 - (void)postGamepadReport:(struct JoyConReportData)report;
 - (void)postMouseReport:(struct JoyConMouseReportData)report;
+- (void)postKeyboardReport:(struct JoyConKeyboardReportData)report;
 - (void)postNFCReport:(struct JoyConNFCReportData)report;
 - (BOOL)copyLatestRumbleReport:(struct JoyConRumbleReportData *)report;
 - (BOOL)setSDLOnlyMode:(BOOL)enabled;

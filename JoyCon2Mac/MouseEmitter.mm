@@ -1,8 +1,10 @@
 #import "MouseEmitter.h"
+#import <ApplicationServices/ApplicationServices.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 
 // Structurally a port of the single-Right-JoyCon mouse handler from
 // joycon2cpp/testapp/src/testapp.cpp, extended so the left Joy-Con 2 can
@@ -67,7 +69,44 @@
 - (void)releaseAllMouseButtons;
 - (BOOL)isSideOnSurface:(JoyConSide)side;
 - (JoyConSide)resolvedActiveSide;
+- (void)emitGyroPointerTick;
+- (void)updateGyroCalibration:(GyroPointerSample &)sample now:(double)now;
+- (void)updateGyroCalibrationState;
+- (void)updateGyroMouseButtons;
+- (void)resetOpticalGesture;
+- (void)routeOpticalGestureDeltaX:(int)dx deltaY:(int)dy;
+- (void)emitControlArrowUsage:(uint8_t)usage;
 @end
+
+static double MonotonicSeconds() {
+    struct timespec time = {};
+    clock_gettime(CLOCK_MONOTONIC, &time);
+    return static_cast<double>(time.tv_sec) + static_cast<double>(time.tv_nsec) / 1000000000.0;
+}
+
+static MotionData CanonicalGyroMotion(MotionData motion, JoyConSide side) {
+    // Joy-Con 2 hardware captures show both halves already use the same
+    // upright grip frame. Keep this explicit transform boundary so a future
+    // firmware revision can be corrected per-side without touching fusion.
+    (void)side;
+    return motion;
+}
+
+static uint32_t ToggleMaskForBinding(NSString *binding, JoyConSide side) {
+    if (side == JoyConSide::Left) {
+        if ([binding isEqualToString:@"minus"]) return BTN_LEFT_MINUS;
+        if ([binding isEqualToString:@"sl"]) return BTN_LEFT_SLL;
+        if ([binding isEqualToString:@"sr"]) return BTN_LEFT_SRL;
+        if ([binding isEqualToString:@"stick"]) return BTN_LEFT_L3;
+        return BTN_LEFT_CAPTURE;
+    }
+    if ([binding isEqualToString:@"home"]) return BTN_RIGHT_HOME;
+    if ([binding isEqualToString:@"plus"]) return BTN_RIGHT_PLUS;
+    if ([binding isEqualToString:@"sl"]) return BTN_RIGHT_SLR;
+    if ([binding isEqualToString:@"sr"]) return BTN_RIGHT_SRR;
+    if ([binding isEqualToString:@"stick"]) return BTN_RIGHT_R3;
+    return BTN_RIGHT_CHAT;
+}
 
 static int16_t ClampMouseDelta(int value) {
     return static_cast<int16_t>(std::clamp(value, -32768, 32767));
@@ -75,6 +114,22 @@ static int16_t ClampMouseDelta(int value) {
 
 static int8_t ClampMouseWheel(int value) {
     return static_cast<int8_t>(std::clamp(value, -127, 127));
+}
+
+static int ExtractWholeMouseDelta(double value) {
+    constexpr double epsilon = 1e-9;
+    return value >= 0
+        ? static_cast<int>(std::floor(value + epsilon))
+        : static_cast<int>(std::ceil(value - epsilon));
+}
+
+static double GyroCountsPerDegree(MouseMode mode) {
+    double displayWidth = CGDisplayBounds(CGMainDisplayID()).size.width;
+    if (displayWidth <= 0) displayWidth = 1920.0;
+    double multiplier = 24.0;
+    if (mode == MouseModeSlow) multiplier = 16.0;
+    else if (mode == MouseModeFast) multiplier = 32.0;
+    return (displayWidth / 360.0) * multiplier;
 }
 
 @implementation MouseEmitter
@@ -85,6 +140,26 @@ static int8_t ClampMouseWheel(int value) {
         _driverClient = client;
         _currentMode = MouseModeNormal;
         _source = MouseSourceAuto;
+        _pointerMethod = PointerMethodOptical;
+        _gyroSource = GyroMouseSourceFused;
+        _gyroAimingEnabled = NO;
+        _leftGyroToggleBinding = @"capture";
+        _rightGyroToggleBinding = @"chat";
+        _gyroActiveSourceName = @"none";
+        _gyroCalibrating = YES;
+        _opticalGestureChordActive = NO;
+        _opticalGestureTriggered = NO;
+        _opticalGestureX = 0;
+        _opticalGestureY = 0;
+        _gyroLastTick = MonotonicSeconds();
+        _gyroFractionX = 0;
+        _gyroFractionY = 0;
+        _gyroTogglePressedLeft = NO;
+        _gyroTogglePressedRight = NO;
+        _gyroButtonStateLeft = 0;
+        _gyroButtonStateRight = 0;
+        _gyroButtonTimestampLeft = 0;
+        _gyroButtonTimestampRight = 0;
         _lastActiveSide = JoyConSide::Right;
         _lastDistanceLeft = 0;
         _lastDistanceRight = 0;
@@ -105,8 +180,27 @@ static int8_t ClampMouseWheel(int value) {
         _mb4Pressed = NO;
         _mb5Pressed = NO;
         _hidButtons = 0;
+
+        __weak MouseEmitter *weakSelf = self;
+        _gyroTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                            dispatch_get_main_queue());
+        dispatch_source_set_timer(_gyroTimer,
+                                  dispatch_time(DISPATCH_TIME_NOW, 8333333ULL),
+                                  8333333ULL,
+                                  2083333ULL);
+        dispatch_source_set_event_handler(_gyroTimer, ^{
+            [weakSelf emitGyroPointerTick];
+        });
+        dispatch_resume(_gyroTimer);
     }
     return self;
+}
+
+- (void)dealloc {
+    if (_gyroTimer) {
+        dispatch_source_cancel(_gyroTimer);
+        _gyroTimer = nullptr;
+    }
 }
 
 - (void)setCurrentMode:(MouseMode)currentMode {
@@ -118,8 +212,317 @@ static int8_t ClampMouseWheel(int value) {
     _firstOpticalReadLeft = YES;
     _firstOpticalReadRight = YES;
     _scrollAccumulator = 0.0f;
+    [self resetOpticalGesture];
     if (currentMode == MouseModeOff) {
+        self.gyroAimingEnabled = NO;
         [self releaseAllMouseButtons];
+    }
+}
+
+- (void)setPointerMethod:(PointerMethod)pointerMethod {
+    if (_pointerMethod == pointerMethod) return;
+    _pointerMethod = pointerMethod;
+    [self resetGyroAiming];
+    _firstOpticalReadLeft = YES;
+    _firstOpticalReadRight = YES;
+    [self releaseAllMouseButtons];
+    [self resetOpticalGesture];
+}
+
+- (void)setGyroSource:(GyroMouseSource)gyroSource {
+    if (_gyroSource == gyroSource) return;
+    _gyroSource = gyroSource;
+    [self resetGyroAiming];
+    [self updateGyroCalibrationState];
+}
+
+- (void)setGyroAimingEnabled:(BOOL)gyroAimingEnabled {
+    if (_gyroAimingEnabled == gyroAimingEnabled) return;
+    _gyroAimingEnabled = gyroAimingEnabled;
+    _gyroLastTick = MonotonicSeconds();
+    _gyroFractionX = 0;
+    _gyroFractionY = 0;
+    if (!gyroAimingEnabled) {
+        _gyroActiveSourceName = @"none";
+        [self releaseAllMouseButtons];
+    }
+}
+
+- (void)setLeftGyroToggleBinding:(NSString *)binding {
+    _leftGyroToggleBinding = [binding copy];
+    _gyroTogglePressedLeft = NO;
+}
+
+- (void)setRightGyroToggleBinding:(NSString *)binding {
+    _rightGyroToggleBinding = [binding copy];
+    _gyroTogglePressedRight = NO;
+}
+
+- (void)resetGyroAiming {
+    self.gyroAimingEnabled = NO;
+    _gyroTogglePressedLeft = NO;
+    _gyroTogglePressedRight = NO;
+    _gyroButtonStateLeft = 0;
+    _gyroButtonStateRight = 0;
+    _gyroButtonTimestampLeft = 0;
+    _gyroButtonTimestampRight = 0;
+}
+
+- (void)requestGyroCalibration {
+    @synchronized (self) {
+        self.gyroAimingEnabled = NO;
+        const double now = MonotonicSeconds();
+        const bool leftFresh = _gyroLeft.valid && now - _gyroLeft.timestamp <= 0.0455;
+        const bool rightFresh = _gyroRight.valid && now - _gyroRight.timestamp <= 0.0455;
+        _gyroLeft.manualPending = leftFresh;
+        _gyroRight.manualPending = rightFresh;
+        if (_gyroLeft.manualPending) {
+            _gyroLeft.stationaryStart = 0;
+            _gyroLeft.stationarySamples = 0;
+            _gyroLeft.sumX = _gyroLeft.sumY = _gyroLeft.sumZ = 0;
+        }
+        if (_gyroRight.manualPending) {
+            _gyroRight.stationaryStart = 0;
+            _gyroRight.stationarySamples = 0;
+            _gyroRight.sumX = _gyroRight.sumY = _gyroRight.sumZ = 0;
+        }
+        [self updateGyroCalibrationState];
+    }
+}
+
+- (uint32_t)processGyroMotion:(MotionData)motion
+                         side:(JoyConSide)side
+                  buttonState:(uint32_t)buttonState {
+    const double now = MonotonicSeconds();
+    uint32_t consumedMask = 0;
+    @synchronized (self) {
+        GyroPointerSample &sample = side == JoyConSide::Left ? _gyroLeft : _gyroRight;
+        sample.motion = CanonicalGyroMotion(motion, side);
+        sample.timestamp = now;
+        sample.valid = true;
+        [self updateGyroCalibration:sample now:now];
+
+        if (sample.rearmPending && !sample.onSurface) {
+            const MotionData &m = sample.motion;
+            const double accelMagnitude = std::sqrt(m.accelX * m.accelX
+                                                  + m.accelY * m.accelY
+                                                  + m.accelZ * m.accelZ);
+            const double gyroMagnitude = std::sqrt(m.gyroX * m.gyroX
+                                                 + m.gyroY * m.gyroY
+                                                 + m.gyroZ * m.gyroZ);
+            const bool settled = std::fabs(accelMagnitude - 1.0) < 0.18
+                              && gyroMagnitude < 8.0;
+            if (settled) {
+                if (sample.rearmStillStart == 0) sample.rearmStillStart = now;
+                if (now - sample.rearmStillStart >= 0.15) {
+                    sample.rearmPending = false;
+                    sample.rearmStillStart = 0;
+                }
+            } else {
+                sample.rearmStillStart = 0;
+            }
+        }
+
+        if (_pointerMethod == PointerMethodGyro) {
+            uint32_t mask = ToggleMaskForBinding(side == JoyConSide::Left
+                                                  ? _leftGyroToggleBinding
+                                                  : _rightGyroToggleBinding,
+                                                  side);
+            BOOL pressed = (buttonState & mask) != 0;
+            BOOL *wasPressed = side == JoyConSide::Left
+                                 ? &_gyroTogglePressedLeft
+                                 : &_gyroTogglePressedRight;
+            if (pressed && !*wasPressed) {
+                self.gyroAimingEnabled = !self.gyroAimingEnabled;
+            }
+            *wasPressed = pressed;
+            if (pressed) consumedMask = mask;
+            buttonState &= ~mask;
+        }
+        if (side == JoyConSide::Left) {
+            _gyroButtonStateLeft = buttonState;
+            _gyroButtonTimestampLeft = now;
+        } else {
+            _gyroButtonStateRight = buttonState;
+            _gyroButtonTimestampRight = now;
+        }
+        if (_pointerMethod == PointerMethodGyro) {
+            [self updateGyroMouseButtons];
+        }
+        [self updateGyroCalibrationState];
+    }
+    return consumedMask;
+}
+
+- (void)updateGyroCalibration:(GyroPointerSample &)sample now:(double)now {
+    const MotionData &m = sample.motion;
+    const double accelMagnitude = std::sqrt(m.accelX * m.accelX
+                                          + m.accelY * m.accelY
+                                          + m.accelZ * m.accelZ);
+    const double gyroMagnitude = std::sqrt(m.gyroX * m.gyroX
+                                         + m.gyroY * m.gyroY
+                                         + m.gyroZ * m.gyroZ);
+    const double gyroLimit = sample.manualPending ? 5.0 : 0.5;
+    const bool stationary = std::fabs(accelMagnitude - 1.0) < 0.12
+                         && gyroMagnitude < gyroLimit;
+    if (!stationary) {
+        sample.stationaryStart = 0;
+        sample.stationarySamples = 0;
+        sample.sumX = sample.sumY = sample.sumZ = 0;
+        return;
+    }
+
+    if (sample.stationaryStart == 0) sample.stationaryStart = now;
+    sample.sumX += m.gyroX;
+    sample.sumY += m.gyroY;
+    sample.sumZ += m.gyroZ;
+    sample.stationarySamples += 1;
+
+    if (now - sample.stationaryStart < 0.75 || sample.stationarySamples < 20) return;
+
+    const float averageX = static_cast<float>(sample.sumX / sample.stationarySamples);
+    const float averageY = static_cast<float>(sample.sumY / sample.stationarySamples);
+    const float averageZ = static_cast<float>(sample.sumZ / sample.stationarySamples);
+    if (sample.biasValid && !sample.manualPending) {
+        sample.biasX = sample.biasX * 0.9f + averageX * 0.1f;
+        sample.biasY = sample.biasY * 0.9f + averageY * 0.1f;
+        sample.biasZ = sample.biasZ * 0.9f + averageZ * 0.1f;
+    } else {
+        sample.biasX = averageX;
+        sample.biasY = averageY;
+        sample.biasZ = averageZ;
+    }
+    sample.biasValid = true;
+    sample.manualPending = false;
+    sample.stationaryStart = now;
+    sample.stationarySamples = 0;
+    sample.sumX = sample.sumY = sample.sumZ = 0;
+}
+
+- (void)updateGyroCalibrationState {
+    const bool anySample = _gyroLeft.valid || _gyroRight.valid;
+    bool needsLeft = _gyroSource != GyroMouseSourceRight && _gyroLeft.valid;
+    bool needsRight = _gyroSource != GyroMouseSourceLeft && _gyroRight.valid;
+    _gyroCalibrating = (needsLeft && (!_gyroLeft.biasValid || _gyroLeft.manualPending))
+                    || (needsRight && (!_gyroRight.biasValid || _gyroRight.manualPending))
+                    || !anySample;
+}
+
+- (void)updateGyroMouseButtons {
+    if (_pointerMethod != PointerMethodGyro || !_gyroAimingEnabled) {
+        [self releaseAllMouseButtons];
+        return;
+    }
+    const double now = MonotonicSeconds();
+    const bool useLeft = _gyroSource != GyroMouseSourceRight;
+    const bool useRight = _gyroSource != GyroMouseSourceLeft;
+    const bool leftFresh = now - _gyroButtonTimestampLeft <= 0.0455;
+    const bool rightFresh = now - _gyroButtonTimestampRight <= 0.0455;
+    const BOOL leftClick = (useLeft && leftFresh && (_gyroButtonStateLeft & BTN_LEFT_L))
+                        || (useRight && rightFresh && (_gyroButtonStateRight & BTN_RIGHT_R));
+    const BOOL rightClick = (useLeft && leftFresh && (_gyroButtonStateLeft & BTN_LEFT_ZL))
+                         || (useRight && rightFresh && (_gyroButtonStateRight & BTN_RIGHT_ZR));
+    const BOOL middleClick = (useLeft && leftFresh && (_gyroButtonStateLeft & BTN_LEFT_L3))
+                          || (useRight && rightFresh && (_gyroButtonStateRight & BTN_RIGHT_R3));
+    if (leftClick != _leftBtnPressed) {
+        [self sendMouseButton:0x01 down:leftClick];
+        _leftBtnPressed = leftClick;
+    }
+    if (rightClick != _rightBtnPressed) {
+        [self sendMouseButton:0x02 down:rightClick];
+        _rightBtnPressed = rightClick;
+    }
+    if (middleClick != _middleBtnPressed) {
+        [self sendMouseButton:0x04 down:middleClick];
+        _middleBtnPressed = middleClick;
+    }
+}
+
+- (void)emitGyroPointerTick {
+    @synchronized (self) {
+        const double now = MonotonicSeconds();
+        if (_pointerMethod == PointerMethodGyro) {
+            [self updateGyroMouseButtons];
+        }
+        double dt = now - _gyroLastTick;
+        _gyroLastTick = now;
+        if (_pointerMethod != PointerMethodGyro || !_gyroAimingEnabled
+            || _currentMode == MouseModeOff || !_driverClient || ![_driverClient isRunning]) {
+            _gyroFractionX = _gyroFractionY = 0;
+            return;
+        }
+        dt = std::clamp(dt, 0.0, 0.025);
+        const bool leftFresh = _gyroLeft.valid && _gyroLeft.surfaceKnown
+                            && !_gyroLeft.onSurface && !_gyroLeft.rearmPending
+                            && now - _gyroLeft.timestamp <= 0.0455;
+        const bool rightFresh = _gyroRight.valid && _gyroRight.surfaceKnown
+                             && !_gyroRight.onSurface && !_gyroRight.rearmPending
+                             && now - _gyroRight.timestamp <= 0.0455;
+
+        const GyroPointerSample *a = nullptr;
+        const GyroPointerSample *b = nullptr;
+        if (_gyroSource == GyroMouseSourceLeft) {
+            if (leftFresh) a = &_gyroLeft;
+        } else if (_gyroSource == GyroMouseSourceRight) {
+            if (rightFresh) a = &_gyroRight;
+        } else {
+            if (leftFresh) a = &_gyroLeft;
+            if (rightFresh) {
+                if (a) b = &_gyroRight;
+                else a = &_gyroRight;
+            }
+        }
+        if (!a) {
+            _gyroActiveSourceName = @"none";
+            _gyroFractionX = _gyroFractionY = 0;
+            return;
+        }
+
+        struct PointerRates {
+            double pitch;
+            double yaw;
+        };
+        auto playerSpaceRates = [](const GyroPointerSample *sample) -> PointerRates {
+            const double gyroX = sample->motion.gyroX - sample->biasX;
+            const double gyroY = sample->motion.gyroY - sample->biasY;
+            const double gyroZ = sample->motion.gyroZ - sample->biasZ;
+            const double gravityLength = std::sqrt(sample->motion.accelX * sample->motion.accelX
+                                                 + sample->motion.accelY * sample->motion.accelY
+                                                 + sample->motion.accelZ * sample->motion.accelZ);
+            if (gravityLength < 0.1) return {gyroX, gyroZ};
+
+            const double gravityY = sample->motion.accelY / gravityLength;
+            const double gravityZ = sample->motion.accelZ / gravityLength;
+            const double worldYaw = gyroY * gravityY + gyroZ * gravityZ;
+            const double relaxedYaw = std::min(std::fabs(worldYaw) * std::sqrt(2.0),
+                                               std::hypot(gyroY, gyroZ));
+            const double playerYaw = worldYaw == 0
+                                   ? 0
+                                   : std::copysign(relaxedYaw, worldYaw);
+            return {gyroX, playerYaw};
+        };
+        PointerRates rates = playerSpaceRates(a);
+        double pitch = rates.pitch;
+        double yaw = rates.yaw;
+        if (b) {
+            const PointerRates secondRates = playerSpaceRates(b);
+            pitch = (pitch + secondRates.pitch) * 0.5;
+            yaw = (yaw + secondRates.yaw) * 0.5;
+            _gyroActiveSourceName = @"fused";
+        } else {
+            _gyroActiveSourceName = a == &_gyroLeft ? @"left" : @"right";
+        }
+
+        const double countsPerDegree = GyroCountsPerDegree(_currentMode);
+        _gyroFractionX += -yaw * dt * countsPerDegree;
+        _gyroFractionY += -pitch * dt * countsPerDegree;
+        const int dx = ExtractWholeMouseDelta(_gyroFractionX);
+        const int dy = ExtractWholeMouseDelta(_gyroFractionY);
+        _gyroFractionX -= dx;
+        _gyroFractionY -= dy;
+        if (dx != 0 || dy != 0) {
+            [self postMouseReportDeltaX:dx deltaY:dy scroll:0];
+        }
     }
 }
 
@@ -143,6 +546,7 @@ static int8_t ClampMouseWheel(int value) {
     // not immediately flip us back to the side we were on before.
     _airFramesLeft = 0;
     _airFramesRight = 0;
+    [self resetOpticalGesture];
     [self releaseAllMouseButtons];
 }
 
@@ -185,6 +589,19 @@ static int8_t ClampMouseWheel(int value) {
         }
     }
 
+    GyroPointerSample &gyroSample = side == JoyConSide::Left ? _gyroLeft : _gyroRight;
+    const bool onSurface = mouseDistance == 0;
+    if (!gyroSample.surfaceKnown || onSurface != gyroSample.onSurface) {
+        gyroSample.rearmPending = onSurface || gyroSample.onSurface;
+        gyroSample.rearmStillStart = 0;
+    }
+    if (onSurface) {
+        gyroSample.rearmPending = true;
+        gyroSample.rearmStillStart = 0;
+    }
+    gyroSample.surfaceKnown = true;
+    gyroSample.onSurface = onSurface;
+
     // Update `lastActiveSide` in Auto mode so the UI badge is correct
     // regardless of the mouse emitter's on/off state. With manual Left /
     // Right, lastActiveSide is already pinned by setSource.
@@ -222,6 +639,9 @@ static int8_t ClampMouseWheel(int value) {
         // but we don't drive the cursor or consume the packet.
         return NO;
     }
+    if (_pointerMethod != PointerMethodOptical) {
+        return NO;
+    }
     if (!_driverClient || ![_driverClient isRunning]) {
         return NO;
     }
@@ -250,6 +670,7 @@ static int8_t ClampMouseWheel(int value) {
             _firstOpticalReadRight = YES;
         }
         _scrollAccumulator = 0.0f;
+        [self resetOpticalGesture];
         [self releaseAllMouseButtons];
         return NO;
     }
@@ -317,6 +738,26 @@ static int8_t ClampMouseWheel(int value) {
     BOOL mouseRightNow  = (btnState & rightMask)  != 0;
     BOOL mouseMiddleNow = (btnState & middleMask) != 0;
 
+    // Optical-only system gesture chord. A normal mouse HID cannot produce
+    // multitouch contacts, so translate the completed direction to macOS's
+    // documented Control+Arrow navigation shortcuts through our keyboard HID.
+    BOOL gestureChordNow = mouseLeftNow && mouseRightNow;
+    if (gestureChordNow && !_opticalGestureChordActive) {
+        _opticalGestureChordActive = YES;
+        _opticalGestureTriggered = NO;
+        _opticalGestureX = 0;
+        _opticalGestureY = 0;
+        [self releaseAllMouseButtons];
+    } else if (!gestureChordNow && _opticalGestureChordActive) {
+        [self resetOpticalGesture];
+    }
+
+    if (_opticalGestureChordActive) {
+        mouseLeftNow = NO;
+        mouseRightNow = NO;
+        mouseMiddleNow = NO;
+    }
+
     if (mouseLeftNow != _leftBtnPressed) {
         [self sendMouseButton:0x01 down:mouseLeftNow];
         _leftBtnPressed = mouseLeftNow;
@@ -333,7 +774,7 @@ static int8_t ClampMouseWheel(int value) {
     // --- 3. Stick scrolling + side buttons (joycon2cpp constants) ---
     int scroll = 0;
     const int SCROLL_DEADZONE = 4000;
-    if (std::abs((int)stickData.y) > SCROLL_DEADZONE) {
+    if (!_opticalGestureChordActive && std::abs((int)stickData.y) > SCROLL_DEADZONE) {
         float intensity = (std::abs((int)stickData.y) - SCROLL_DEADZONE) /
                           (32767.0f - SCROLL_DEADZONE);
         float speed = intensity * 40.0f;
@@ -348,12 +789,14 @@ static int8_t ClampMouseWheel(int value) {
         _scrollAccumulator = 0.0f;
     }
 
-    if (moveX != 0 || moveY != 0 || scroll != 0) {
+    if (_opticalGestureChordActive) {
+        [self routeOpticalGestureDeltaX:moveX deltaY:moveY];
+    } else if (moveX != 0 || moveY != 0 || scroll != 0) {
         [self postMouseReportDeltaX:moveX deltaY:moveY scroll:scroll];
     }
 
     const int BUTTON_THRESHOLD = 28000;
-    if (stickData.x < -BUTTON_THRESHOLD) {
+    if (!_opticalGestureChordActive && stickData.x < -BUTTON_THRESHOLD) {
         if (!_mb4Pressed) {
             [self sendXButton:1]; // Back
             _mb4Pressed = YES;
@@ -361,7 +804,7 @@ static int8_t ClampMouseWheel(int value) {
     } else {
         _mb4Pressed = NO;
     }
-    if (stickData.x > BUTTON_THRESHOLD) {
+    if (!_opticalGestureChordActive && stickData.x > BUTTON_THRESHOLD) {
         if (!_mb5Pressed) {
             [self sendXButton:2]; // Forward
             _mb5Pressed = YES;
@@ -426,7 +869,7 @@ static int8_t ClampMouseWheel(int value) {
 }
 
 - (BOOL)isSideMouseOwned:(JoyConSide)side {
-    if (_currentMode == MouseModeOff) {
+    if (_pointerMethod != PointerMethodOptical || _currentMode == MouseModeOff) {
         return NO;
     }
     if (!_driverClient || ![_driverClient isRunning]) {
@@ -488,6 +931,46 @@ static int8_t ClampMouseWheel(int value) {
     _middleBtnPressed = NO;
     _mb4Pressed = NO;
     _mb5Pressed = NO;
+}
+
+- (void)resetOpticalGesture {
+    _opticalGestureChordActive = NO;
+    _opticalGestureTriggered = NO;
+    _opticalGestureX = 0;
+    _opticalGestureY = 0;
+}
+
+- (void)routeOpticalGestureDeltaX:(int)dx deltaY:(int)dy {
+    if (!_opticalGestureChordActive || _opticalGestureTriggered) return;
+
+    _opticalGestureX += dx;
+    _opticalGestureY += dy;
+    constexpr double threshold = 60.0;
+    if (std::fabs(_opticalGestureX) < threshold &&
+        std::fabs(_opticalGestureY) < threshold) {
+        return;
+    }
+
+    uint8_t usage = 0;
+    if (std::fabs(_opticalGestureX) >= std::fabs(_opticalGestureY)) {
+        usage = _opticalGestureX < 0 ? 0x50 : 0x4F; // Left / Right Arrow
+    } else {
+        usage = _opticalGestureY < 0 ? 0x52 : 0x51; // Up / Down Arrow
+    }
+    _opticalGestureTriggered = YES;
+    [self emitControlArrowUsage:usage];
+}
+
+- (void)emitControlArrowUsage:(uint8_t)usage {
+    if (!_driverClient || ![_driverClient isRunning]) return;
+
+    struct JoyConKeyboardReportData pressed = {};
+    pressed.modifiers = 0x01; // Left Control
+    pressed.keys[0] = usage;
+    [_driverClient postKeyboardReport:pressed];
+
+    struct JoyConKeyboardReportData released = {};
+    [_driverClient postKeyboardReport:released];
 }
 
 @end

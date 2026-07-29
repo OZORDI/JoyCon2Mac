@@ -156,7 +156,7 @@ struct MainWindow: View {
         switch selectedSection {
         case .controllers: return "Bluetooth connection, battery, and packet status"
         case .gamepad: return "Combined HID gamepad report"
-        case .mouse: return "Optical sensor mouse output"
+        case .mouse: return "Optical and free-air gyro pointer output"
         case .gyro: return "IMU motion telemetry"
         case .nfc: return "Vendor NFC report stream"
         case .settings: return "Driver and app preferences"

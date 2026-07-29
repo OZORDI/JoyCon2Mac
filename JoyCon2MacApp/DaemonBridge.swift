@@ -36,6 +36,13 @@ struct ControllerState: Identifiable {
     var mouseMode: MouseMode
     var mouseSource: MouseSource
     var mouseActiveSide: String
+    var pointerMethod: PointerMethod
+    var gyroMouseSource: GyroMouseSource
+    var gyroAimingEnabled: Bool
+    var gyroCalibrating: Bool
+    var gyroActiveSource: String
+    var leftGyroToggleBinding: GyroToggleBinding
+    var rightGyroToggleBinding: GyroToggleBinding
     var rssi: Int
 }
 
@@ -82,6 +89,39 @@ enum MouseSource: Int {
         case .right: return "Right Joy-Con"
         }
     }
+}
+
+enum PointerMethod: Int {
+    case optical = 0
+    case gyroAiming = 1
+}
+
+enum GyroMouseSource: Int {
+    case fused = 0
+    case left = 1
+    case right = 2
+}
+
+enum GyroToggleBinding: String, CaseIterable, Identifiable {
+    case capture, chat, minus, plus, home, sl, sr, stick
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .capture: return "Capture"
+        case .chat: return "Chat"
+        case .minus: return "Minus"
+        case .plus: return "Plus"
+        case .home: return "Home"
+        case .sl: return "SL"
+        case .sr: return "SR"
+        case .stick: return "Stick Click"
+        }
+    }
+
+    static let leftChoices: [GyroToggleBinding] = [.capture, .minus, .sl, .sr, .stick]
+    static let rightChoices: [GyroToggleBinding] = [.chat, .home, .plus, .sl, .sr, .stick]
 }
 
 struct NFCDecodedRecord: Identifiable, Equatable {
@@ -542,6 +582,7 @@ class DaemonBridge: ObservableObject {
             isDaemonRunning = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 self?.sendStoredRailBindings()
+                self?.sendStoredMouseSettings()
             }
         } catch {
             TelemetryStore.shared.append("Failed to start daemon: \(error)")
@@ -842,6 +883,7 @@ class DaemonBridge: ObservableObject {
                 else if status == "controlFile" {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                         self?.sendStoredRailBindings()
+                        self?.sendStoredMouseSettings()
                     }
                 }
             }
@@ -983,6 +1025,13 @@ class DaemonBridge: ObservableObject {
             mouseMode: MouseMode(rawValue: intValue(object["mouseMode"])) ?? .off,
             mouseSource: MouseSource(rawValue: intValue(object["mouseSource"])) ?? .auto,
             mouseActiveSide: stringValue(object["mouseActiveSide"], default: "right"),
+            pointerMethod: PointerMethod(rawValue: intValue(object["pointerMethod"])) ?? .optical,
+            gyroMouseSource: GyroMouseSource(rawValue: intValue(object["gyroMouseSource"])) ?? .fused,
+            gyroAimingEnabled: (object["gyroAimingEnabled"] as? NSNumber)?.boolValue ?? false,
+            gyroCalibrating: (object["gyroCalibrating"] as? NSNumber)?.boolValue ?? true,
+            gyroActiveSource: stringValue(object["gyroActiveSource"], default: "none"),
+            leftGyroToggleBinding: GyroToggleBinding(rawValue: stringValue(object["leftGyroToggleBinding"], default: "capture")) ?? .capture,
+            rightGyroToggleBinding: GyroToggleBinding(rawValue: stringValue(object["rightGyroToggleBinding"], default: "chat")) ?? .chat,
             rssi: intValue(object["rssi"], default: 0)
         )
     }
@@ -1043,6 +1092,12 @@ class DaemonBridge: ObservableObject {
     private var pendingMouseModeDeadline: Date?
     private var pendingMouseSource: MouseSource?
     private var pendingMouseSourceDeadline: Date?
+    private var pendingPointerMethod: PointerMethod?
+    private var pendingPointerMethodDeadline: Date?
+    private var pendingGyroMouseSource: GyroMouseSource?
+    private var pendingGyroMouseSourceDeadline: Date?
+    private var pendingGyroAimingEnabled: Bool?
+    private var pendingGyroAimingEnabledDeadline: Date?
     private let pendingEchoWindow: TimeInterval = 0.6
 
     private func scheduleMainApplyLocked() {
@@ -1104,6 +1159,11 @@ class DaemonBridge: ObservableObject {
                         triggerL: 0, triggerR: 0,
                         packetCount: 0, mouseMode: .normal,
                         mouseSource: .auto, mouseActiveSide: "right",
+                        pointerMethod: .optical, gyroMouseSource: .fused,
+                        gyroAimingEnabled: false, gyroCalibrating: true,
+                        gyroActiveSource: "none",
+                        leftGyroToggleBinding: .capture,
+                        rightGyroToggleBinding: .chat,
                         rssi: 0
                     )
                 )
@@ -1144,6 +1204,42 @@ class DaemonBridge: ObservableObject {
             } else if pendingMouseSourceDeadline != nil {
                 pendingMouseSource = nil
                 pendingMouseSourceDeadline = nil
+            }
+            if let pending = pendingPointerMethod,
+               let deadline = pendingPointerMethodDeadline, now < deadline {
+                if merged.pointerMethod == pending {
+                    pendingPointerMethod = nil
+                    pendingPointerMethodDeadline = nil
+                } else {
+                    merged.pointerMethod = pending
+                }
+            } else if pendingPointerMethodDeadline != nil {
+                pendingPointerMethod = nil
+                pendingPointerMethodDeadline = nil
+            }
+            if let pending = pendingGyroMouseSource,
+               let deadline = pendingGyroMouseSourceDeadline, now < deadline {
+                if merged.gyroMouseSource == pending {
+                    pendingGyroMouseSource = nil
+                    pendingGyroMouseSourceDeadline = nil
+                } else {
+                    merged.gyroMouseSource = pending
+                }
+            } else if pendingGyroMouseSourceDeadline != nil {
+                pendingGyroMouseSource = nil
+                pendingGyroMouseSourceDeadline = nil
+            }
+            if let pending = pendingGyroAimingEnabled,
+               let deadline = pendingGyroAimingEnabledDeadline, now < deadline {
+                if merged.gyroAimingEnabled == pending {
+                    pendingGyroAimingEnabled = nil
+                    pendingGyroAimingEnabledDeadline = nil
+                } else {
+                    merged.gyroAimingEnabled = pending
+                }
+            } else if pendingGyroAimingEnabledDeadline != nil {
+                pendingGyroAimingEnabled = nil
+                pendingGyroAimingEnabledDeadline = nil
             }
 
             if let index = updated.firstIndex(where: { $0.id == merged.id }) {
@@ -1191,6 +1287,7 @@ class DaemonBridge: ObservableObject {
 
     func setMouseMode(_ mode: MouseMode) {
         sendControlCommand(["cmd": "setMouseMode", "value": mode.rawValue])
+        UserDefaults.standard.set(mode.rawValue, forKey: "mouse.mode")
         // Hold the pending value across stale state echoes so the Picker
         // doesn't flash back to the previous selection while the daemon
         // catches up. See pendingEchoWindow for the window length.
@@ -1208,12 +1305,99 @@ class DaemonBridge: ObservableObject {
 
     func setMouseSource(_ source: MouseSource) {
         sendControlCommand(["cmd": "setMouseSource", "value": source.rawValue])
+        UserDefaults.standard.set(source.rawValue, forKey: "mouse.opticalSource")
         pendingMouseSource = source
         pendingMouseSourceDeadline = Date().addingTimeInterval(pendingEchoWindow)
         if !controllers.isEmpty {
             var updated = controllers
             for index in updated.indices {
                 updated[index].mouseSource = source
+            }
+            controllers = updated
+            stateRevision &+= 1
+        }
+    }
+
+    func setPointerMethod(_ method: PointerMethod) {
+        let shouldEnableGyro = method == .gyroAiming
+        if shouldEnableGyro, controllers.first?.mouseMode == .off {
+            sendControlCommand(["cmd": "setMouseMode", "value": MouseMode.normal.rawValue])
+            UserDefaults.standard.set(MouseMode.normal.rawValue, forKey: "mouse.mode")
+            pendingMouseMode = .normal
+            pendingMouseModeDeadline = Date().addingTimeInterval(pendingEchoWindow)
+        }
+        sendControlCommand(["cmd": "setPointerMethod", "value": method.rawValue])
+        sendControlCommand(["cmd": "setGyroAimingEnabled", "value": shouldEnableGyro ? 1 : 0])
+        UserDefaults.standard.set(method.rawValue, forKey: "mouse.pointerMethod")
+        pendingPointerMethod = method
+        pendingPointerMethodDeadline = Date().addingTimeInterval(pendingEchoWindow)
+        pendingGyroAimingEnabled = shouldEnableGyro
+        pendingGyroAimingEnabledDeadline = Date().addingTimeInterval(pendingEchoWindow)
+        if !controllers.isEmpty {
+            var updated = controllers
+            for index in updated.indices {
+                if shouldEnableGyro, updated[index].mouseMode == .off {
+                    updated[index].mouseMode = .normal
+                }
+                updated[index].pointerMethod = method
+                updated[index].gyroAimingEnabled = shouldEnableGyro
+            }
+            controllers = updated
+            stateRevision &+= 1
+        }
+    }
+
+    func setGyroMouseSource(_ source: GyroMouseSource) {
+        let shouldResume = controllers.first?.gyroAimingEnabled ?? false
+        sendControlCommand(["cmd": "setGyroMouseSource", "value": source.rawValue])
+        if shouldResume {
+            sendControlCommand(["cmd": "setGyroAimingEnabled", "value": 1])
+        }
+        UserDefaults.standard.set(source.rawValue, forKey: "mouse.gyroSource")
+        pendingGyroMouseSource = source
+        pendingGyroMouseSourceDeadline = Date().addingTimeInterval(pendingEchoWindow)
+        pendingGyroAimingEnabled = shouldResume
+        pendingGyroAimingEnabledDeadline = Date().addingTimeInterval(pendingEchoWindow)
+        if !controllers.isEmpty {
+            var updated = controllers
+            for index in updated.indices {
+                updated[index].gyroMouseSource = source
+                updated[index].gyroAimingEnabled = shouldResume
+            }
+            controllers = updated
+            stateRevision &+= 1
+        }
+    }
+
+    func setGyroAimingEnabled(_ enabled: Bool) {
+        sendControlCommand(["cmd": "setGyroAimingEnabled", "value": enabled ? 1 : 0])
+        pendingGyroAimingEnabled = enabled
+        pendingGyroAimingEnabledDeadline = Date().addingTimeInterval(pendingEchoWindow)
+        if !controllers.isEmpty {
+            var updated = controllers
+            for index in updated.indices { updated[index].gyroAimingEnabled = enabled }
+            controllers = updated
+            stateRevision &+= 1
+        }
+    }
+
+    func calibrateGyroPointer() {
+        sendControlCommand(["cmd": "calibrateGyro"])
+    }
+
+    func setGyroToggleBindings(left: GyroToggleBinding, right: GyroToggleBinding) {
+        UserDefaults.standard.set(left.rawValue, forKey: "mouse.gyroToggleLeft")
+        UserDefaults.standard.set(right.rawValue, forKey: "mouse.gyroToggleRight")
+        sendControlCommand([
+            "cmd": "setGyroToggleBindings",
+            "left": left.rawValue,
+            "right": right.rawValue
+        ])
+        if !controllers.isEmpty {
+            var updated = controllers
+            for index in updated.indices {
+                updated[index].leftGyroToggleBinding = left
+                updated[index].rightGyroToggleBinding = right
             }
             controllers = updated
             stateRevision &+= 1
@@ -1246,6 +1430,22 @@ class DaemonBridge: ObservableObject {
             "rightSL": defaults.string(forKey: "railBinding.rightSL") ?? "none",
             "rightSR": defaults.string(forKey: "railBinding.rightSR") ?? "none"
         ])
+    }
+
+    private func sendStoredMouseSettings() {
+        let defaults = UserDefaults.standard
+        let mode = MouseMode(rawValue: defaults.object(forKey: "mouse.mode") as? Int ?? MouseMode.normal.rawValue) ?? .normal
+        let opticalSource = MouseSource(rawValue: defaults.object(forKey: "mouse.opticalSource") as? Int ?? MouseSource.auto.rawValue) ?? .auto
+        let method = PointerMethod(rawValue: defaults.object(forKey: "mouse.pointerMethod") as? Int ?? PointerMethod.optical.rawValue) ?? .optical
+        let gyroSource = GyroMouseSource(rawValue: defaults.object(forKey: "mouse.gyroSource") as? Int ?? GyroMouseSource.fused.rawValue) ?? .fused
+        let leftBinding = GyroToggleBinding(rawValue: defaults.string(forKey: "mouse.gyroToggleLeft") ?? "capture") ?? .capture
+        let rightBinding = GyroToggleBinding(rawValue: defaults.string(forKey: "mouse.gyroToggleRight") ?? "chat") ?? .chat
+        setMouseMode(mode)
+        setMouseSource(opticalSource)
+        setPointerMethod(method)
+        setGyroMouseSource(gyroSource)
+        setGyroToggleBindings(left: leftBinding, right: rightBinding)
+        setGyroAimingEnabled(false)
     }
 
     private func applyFindStatus(_ detail: String) {

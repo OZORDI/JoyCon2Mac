@@ -46,6 +46,16 @@ struct JoyConHIDMouseReport {
     int8_t  wheel;
 } __attribute__((packed));
 
+struct JoyConHIDKeyboardReport {
+    uint8_t reportId;   // 4
+    uint8_t modifiers;
+    uint8_t reserved;
+    uint8_t keys[6];
+} __attribute__((packed));
+
+static_assert(sizeof(JoyConHIDKeyboardReport) == 9,
+              "Keyboard input report must match descriptor");
+
 struct JoyConHIDNFCReport {
     uint8_t reportId;   // 3
     uint8_t status;
@@ -91,7 +101,8 @@ enum : uint64_t {
     kVirtualJoyConSelectorNFC     = 2,
     kVirtualJoyConSelectorRumble  = 3,
     kVirtualJoyConSelectorHIDMode = 4,
-    kVirtualJoyConSelectorCount   = 5
+    kVirtualJoyConSelectorKeyboard = 5,
+    kVirtualJoyConSelectorCount   = 6
 };
 
 enum : uint8_t {
@@ -105,7 +116,8 @@ enum : uint8_t {
 enum : uint32_t {
     kVirtualLocationGamepad   = 0x4A433201,
     kVirtualLocationDualSense = 0x4A433202,
-    kVirtualLocationMouse     = 0x4A433203
+    kVirtualLocationMouse     = 0x4A433203,
+    kVirtualLocationKeyboard  = 0x4A433204
 };
 
 static JoyConRumbleReportData g_latestRumbleReport = {};
@@ -378,6 +390,36 @@ const uint8_t VirtualMouseDescriptor[] = {
     0x81, 0x06,        //     Input (Data,Var,Rel)
 
     0xC0,              //   End Collection
+    0xC0               // End Collection
+};
+
+// Standard boot-keyboard shape used only for macOS system-navigation
+// shortcuts. Keeping it separate from the mouse avoids changing pointer
+// classification and lets the daemon emit shortcuts without Accessibility.
+const uint8_t VirtualKeyboardDescriptor[] = {
+    0x05, 0x01,        // Usage Page (Generic Desktop)
+    0x09, 0x06,        // Usage (Keyboard)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x04,        //   Report ID (4)
+    0x05, 0x07,        //   Usage Page (Keyboard)
+    0x19, 0xE0,        //   Usage Minimum (Left Control)
+    0x29, 0xE7,        //   Usage Maximum (Right GUI)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x01,        //   Logical Maximum (1)
+    0x75, 0x01,        //   Report Size (1)
+    0x95, 0x08,        //   Report Count (8)
+    0x81, 0x02,        //   Input (Data,Var,Abs)
+    0x75, 0x08,        //   Report Size (8)
+    0x95, 0x01,        //   Report Count (1)
+    0x81, 0x03,        //   Input (Const,Var,Abs)
+    0x05, 0x07,        //   Usage Page (Keyboard)
+    0x19, 0x00,        //   Usage Minimum (0)
+    0x29, 0xFF,        //   Usage Maximum (255)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+    0x75, 0x08,        //   Report Size (8)
+    0x95, 0x06,        //   Report Count (6)
+    0x81, 0x00,        //   Input (Data,Array,Abs)
     0xC0               // End Collection
 };
 
@@ -1020,6 +1062,86 @@ kern_return_t VirtualJoyConMouseDevice::dispatchMouseReport(JoyConMouseReportDat
 }
 
 // ===========================================================================
+// VirtualJoyConKeyboardDevice - system-navigation shortcut HID
+// ===========================================================================
+
+bool VirtualJoyConKeyboardDevice::init() {
+    return super::init();
+}
+
+void VirtualJoyConKeyboardDevice::free() {
+    super::free();
+}
+
+kern_return_t VirtualJoyConKeyboardDevice::Start_Impl(IOService * provider) {
+    kern_return_t ret = Start(provider, SUPERDISPATCH);
+    if (ret != kIOReturnSuccess) return ret;
+    return RegisterService();
+}
+
+kern_return_t VirtualJoyConKeyboardDevice::Stop_Impl(IOService * provider) {
+    return Stop(provider, SUPERDISPATCH);
+}
+
+OSData * VirtualJoyConKeyboardDevice::newReportDescriptor() {
+    return OSData::withBytes(VirtualKeyboardDescriptor, sizeof(VirtualKeyboardDescriptor));
+}
+
+OSDictionary * VirtualJoyConKeyboardDevice::newDeviceDescription() {
+    OSDictionary * description = OSDictionary::withCapacity(10);
+    if (!description) return nullptr;
+
+    OSNumber * vendor       = OSNumber::withNumber(static_cast<uint32_t>(0x057E), 32);
+    OSNumber * product      = OSNumber::withNumber(static_cast<uint32_t>(0x2068), 32);
+    OSNumber * version      = OSNumber::withNumber(static_cast<uint32_t>(1), 32);
+    OSNumber * location     = OSNumber::withNumber(kVirtualLocationKeyboard, 32);
+    OSString * transport    = OSString::withCString("Virtual");
+    OSString * manufacturer = OSString::withCString("JoyCon2Mac");
+    OSString * productName  = OSString::withCString("JoyCon2Mac Gesture Keyboard");
+    OSString * serial       = OSString::withCString("JoyCon2Mac-Keyboard-01");
+
+    if (vendor)       { description->setObject(kIOHIDVendorIDKey,       vendor);       vendor->release(); }
+    if (product)      { description->setObject(kIOHIDProductIDKey,      product);      product->release(); }
+    if (version)      { description->setObject(kIOHIDVersionNumberKey,  version);      version->release(); }
+    if (location)     { description->setObject(kIOHIDLocationIDKey,     location);     location->release(); }
+    if (transport)    { description->setObject(kIOHIDTransportKey,      transport);    transport->release(); }
+    if (manufacturer) { description->setObject(kIOHIDManufacturerKey,   manufacturer); manufacturer->release(); }
+    if (productName)  { description->setObject(kIOHIDProductKey,        productName);  productName->release(); }
+    if (serial)       { description->setObject(kIOHIDSerialNumberKey,   serial);       serial->release(); }
+    return description;
+}
+
+kern_return_t VirtualJoyConKeyboardDevice::setReport(IOMemoryDescriptor *, IOHIDReportType, IOOptionBits, uint32_t, OSAction *) {
+    return kIOReturnUnsupported;
+}
+
+kern_return_t VirtualJoyConKeyboardDevice::getReport(IOMemoryDescriptor *, IOHIDReportType, IOOptionBits, uint32_t, OSAction *) {
+    return kIOReturnUnsupported;
+}
+
+kern_return_t VirtualJoyConKeyboardDevice::dispatchKeyboardReport(JoyConKeyboardReportData reportData) {
+    JoyConHIDKeyboardReport report = {};
+    report.reportId = 4;
+    report.modifiers = reportData.modifiers;
+    report.reserved = reportData.reserved;
+    memcpy(report.keys, reportData.keys, sizeof(report.keys));
+
+    IOBufferMemoryDescriptor * md = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, sizeof(report), 0, &md);
+    if (ret == kIOReturnSuccess && md != nullptr) {
+        IOAddressSegment range = {};
+        if (md->GetAddressRange(&range) == kIOReturnSuccess &&
+            range.address != 0 && range.length >= sizeof(report)) {
+            memcpy((void *)range.address, &report, sizeof(report));
+            md->SetLength(sizeof(report));
+            ret = handleReport(0, md, sizeof(report), kIOHIDReportTypeInput, 0);
+        }
+        md->release();
+    }
+    return ret;
+}
+
+// ===========================================================================
 // VirtualJoyConUserClient — bridges the daemon to the HID device
 // ===========================================================================
 //
@@ -1033,12 +1155,14 @@ struct VirtualJoyConUserClient_IVars {
     VirtualJoyConGamepadDevice * gamepadDevice;
     VirtualJoyConDualSenseDevice * dualSenseDevice;
     VirtualJoyConMouseDevice * mouseDevice;
+    VirtualJoyConKeyboardDevice * keyboardDevice;
     bool sdlOnlyMode;
 };
 
 static kern_return_t ensureGamepadDevice(VirtualJoyConUserClient * self);
 static kern_return_t ensureDualSenseDevice(VirtualJoyConUserClient * self);
 static kern_return_t ensureMouseDevice(VirtualJoyConUserClient * self);
+static kern_return_t ensureKeyboardDevice(VirtualJoyConUserClient * self);
 static kern_return_t ensureAllHIDDevices(VirtualJoyConUserClient * self);
 
 template <typename Device>
@@ -1070,6 +1194,12 @@ static void releaseMouseDevice(VirtualJoyConUserClient * self) {
     }
 }
 
+static void releaseKeyboardDevice(VirtualJoyConUserClient * self) {
+    if (self && self->ivars && self->ivars->keyboardDevice) {
+        terminateAndReleaseDevice(self->ivars->keyboardDevice);
+    }
+}
+
 static void releaseHIDDevices(VirtualJoyConUserClient * self) {
     if (!self || !self->ivars) {
         return;
@@ -1077,6 +1207,7 @@ static void releaseHIDDevices(VirtualJoyConUserClient * self) {
     releaseGamepadDevice(self);
     releaseDualSenseDevice(self);
     releaseMouseDevice(self);
+    releaseKeyboardDevice(self);
 }
 
 bool VirtualJoyConUserClient::init() {
@@ -1206,6 +1337,26 @@ static kern_return_t ensureMouseDevice(VirtualJoyConUserClient * self) {
     return kIOReturnSuccess;
 }
 
+static kern_return_t ensureKeyboardDevice(VirtualJoyConUserClient * self) {
+    if (!self || !self->ivars) return kIOReturnBadArgument;
+    if (self->ivars->keyboardDevice != nullptr) return kIOReturnSuccess;
+
+    IOService * created = nullptr;
+    kern_return_t kr = self->Create(self, "KeyboardDeviceProperties", &created);
+    if (kr != kIOReturnSuccess) {
+        os_log(OS_LOG_DEFAULT,
+               "VirtualJoyConUserClient: Create(KeyboardDeviceProperties) failed 0x%x", kr);
+        return kr;
+    }
+    VirtualJoyConKeyboardDevice * dev = OSDynamicCast(VirtualJoyConKeyboardDevice, created);
+    if (!dev) {
+        if (created) created->release();
+        return kIOReturnUnsupported;
+    }
+    self->ivars->keyboardDevice = dev;
+    return kIOReturnSuccess;
+}
+
 static kern_return_t ensureAllHIDDevices(VirtualJoyConUserClient * self) {
     if (!self || !self->ivars) {
         return kIOReturnBadArgument;
@@ -1215,7 +1366,9 @@ static kern_return_t ensureAllHIDDevices(VirtualJoyConUserClient * self) {
         if (kr != kIOReturnSuccess) {
             return kr;
         }
-        return ensureMouseDevice(self);
+        kr = ensureMouseDevice(self);
+        if (kr != kIOReturnSuccess) return kr;
+        return ensureKeyboardDevice(self);
     }
 
     kern_return_t kr = ensureGamepadDevice(self);
@@ -1227,7 +1380,9 @@ static kern_return_t ensureAllHIDDevices(VirtualJoyConUserClient * self) {
         os_log(OS_LOG_DEFAULT,
                "VirtualJoyConUserClient: DualSense device unavailable 0x%x", kr);
     }
-    return ensureMouseDevice(self);
+    kr = ensureMouseDevice(self);
+    if (kr != kIOReturnSuccess) return kr;
+    return ensureKeyboardDevice(self);
 }
 
 static kern_return_t PostGamepadReport(OSObject * target, void * reference, IOUserClientMethodArguments * arguments) {
@@ -1296,6 +1451,20 @@ static kern_return_t PostMouseReport(OSObject * target, void * reference, IOUser
     JoyConMouseReportData report = {};
     memcpy(&report, bytes, sizeof(report));
     return device->dispatchMouseReport(report);
+}
+
+static kern_return_t PostKeyboardReport(OSObject * target, void * reference, IOUserClientMethodArguments * arguments) {
+    VirtualJoyConUserClient * client = OSDynamicCast(VirtualJoyConUserClient, target);
+    if (!client || !arguments || !arguments->structureInput) return kIOReturnBadArgument;
+    kern_return_t kr = ensureKeyboardDevice(client);
+    if (kr != kIOReturnSuccess) return kr;
+    VirtualJoyConKeyboardDevice * device = client->ivars ? client->ivars->keyboardDevice : nullptr;
+    if (!device) return kIOReturnNotAttached;
+    const void * bytes = arguments->structureInput->getBytesNoCopy(0, sizeof(JoyConKeyboardReportData));
+    if (!bytes) return kIOReturnBadArgument;
+    JoyConKeyboardReportData report = {};
+    memcpy(&report, bytes, sizeof(report));
+    return device->dispatchKeyboardReport(report);
 }
 
 static kern_return_t PostNFCReport(OSObject * target, void * reference, IOUserClientMethodArguments * arguments) {
@@ -1374,6 +1543,8 @@ static kern_return_t SetHIDMode(OSObject * target, void * reference, IOUserClien
         if (kr != kIOReturnSuccess) {
             return kr;
         }
+        kr = ensureKeyboardDevice(client);
+        if (kr != kIOReturnSuccess) return kr;
         os_log(OS_LOG_DEFAULT, "VirtualJoyConUserClient: HID mode set to SDL-only");
         return kIOReturnSuccess;
     }
@@ -1386,6 +1557,8 @@ static kern_return_t SetHIDMode(OSObject * target, void * reference, IOUserClien
     if (kr != kIOReturnSuccess) {
         return kr;
     }
+    kr = ensureKeyboardDevice(client);
+    if (kr != kIOReturnSuccess) return kr;
     os_log(OS_LOG_DEFAULT, "VirtualJoyConUserClient: HID mode set to standard");
     return kIOReturnSuccess;
 }
@@ -1402,6 +1575,7 @@ kern_return_t VirtualJoyConUserClient::ExternalMethod(
         { PostNFCReport,     0, 0, sizeof(JoyConNFCReportData),   0, 0 },
         { CopyRumbleReport,  0, 0, 0,                             0, sizeof(JoyConRumbleReportData) },
         { SetHIDMode,        0, 0, sizeof(JoyConHIDModeData),      0, 0 },
+        { PostKeyboardReport,0, 0, sizeof(JoyConKeyboardReportData), 0, 0 },
     };
 
     if (selector >= kVirtualJoyConSelectorCount) {
