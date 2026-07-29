@@ -76,8 +76,9 @@ struct GyroPointerSample {
 @private
     GyroPointerSample _gyroLeft;
     GyroPointerSample _gyroRight;
-    dispatch_source_t _gyroTimer;
-    double _gyroLastTick;
+    double _gyroLastEmitTimestamp;
+    JoyConSide _gyroEmitClockSide;
+    BOOL _gyroEmitClockValid;
     double _gyroFractionX;
     double _gyroFractionY;
     BOOL _gyroTogglePressedLeft;

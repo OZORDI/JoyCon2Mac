@@ -69,7 +69,7 @@
 - (void)releaseAllMouseButtons;
 - (BOOL)isSideOnSurface:(JoyConSide)side;
 - (JoyConSide)resolvedActiveSide;
-- (void)emitGyroPointerTick;
+- (void)emitGyroPointerForPacketSide:(JoyConSide)side now:(double)now;
 - (void)updateGyroCalibration:(GyroPointerSample &)sample now:(double)now;
 - (void)updateGyroCalibrationState;
 - (void)updateGyroMouseButtons;
@@ -189,7 +189,7 @@ static void UpdateFusedGravity(GyroPointerSample &sample, double previousTimesta
     NormalizeVector(sample.gravityX, sample.gravityY, sample.gravityZ);
 }
 
-static void UpdatePointerRates(GyroPointerSample &sample) {
+static void UpdatePointerRates(GyroPointerSample &sample, JoyConSide side) {
     if (!sample.gravityValid) return;
     const double gyroX = sample.motion.gyroX - sample.biasX;
     const double gyroY = sample.motion.gyroY - sample.biasY;
@@ -197,7 +197,10 @@ static void UpdatePointerRates(GyroPointerSample &sample) {
     const double worldYaw = gyroY * sample.gravityY + gyroZ * sample.gravityZ;
     const double relaxedYaw = std::min(std::fabs(worldYaw) * std::sqrt(2.0),
                                        std::hypot(gyroY, gyroZ));
-    const double playerYaw = worldYaw == 0 ? 0 : std::copysign(relaxedYaw, worldYaw);
+    double playerYaw = worldYaw == 0 ? 0 : std::copysign(relaxedYaw, worldYaw);
+    if (side == JoyConSide::Right) {
+        playerYaw = -playerYaw;
+    }
 
     if (sample.rateHistoryCount == 4) {
         for (uint8_t index = 1; index < 4; ++index) {
@@ -233,6 +236,11 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
     return {newest.pitch, newest.yaw};
 }
 
+static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
+    return sample.valid && sample.surfaceKnown && !sample.onSurface
+        && !sample.rearmPending && now - sample.timestamp <= 0.0455;
+}
+
 @implementation MouseEmitter
 
 - (instancetype)initWithDriverClient:(DriverKitClient *)client {
@@ -252,7 +260,9 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
         _opticalGestureTriggered = NO;
         _opticalGestureX = 0;
         _opticalGestureY = 0;
-        _gyroLastTick = MonotonicSeconds();
+        _gyroLastEmitTimestamp = 0;
+        _gyroEmitClockSide = JoyConSide::Right;
+        _gyroEmitClockValid = NO;
         _gyroFractionX = 0;
         _gyroFractionY = 0;
         _gyroTogglePressedLeft = NO;
@@ -289,26 +299,8 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
         _mb5Pressed = NO;
         _hidButtons = 0;
 
-        __weak MouseEmitter *weakSelf = self;
-        _gyroTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                            dispatch_get_main_queue());
-        dispatch_source_set_timer(_gyroTimer,
-                                  dispatch_time(DISPATCH_TIME_NOW, 8333333ULL),
-                                  8333333ULL,
-                                  2083333ULL);
-        dispatch_source_set_event_handler(_gyroTimer, ^{
-            [weakSelf emitGyroPointerTick];
-        });
-        dispatch_resume(_gyroTimer);
     }
     return self;
-}
-
-- (void)dealloc {
-    if (_gyroTimer) {
-        dispatch_source_cancel(_gyroTimer);
-        _gyroTimer = nullptr;
-    }
 }
 
 - (void)setCurrentMode:(MouseMode)currentMode {
@@ -347,7 +339,8 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
 - (void)setGyroAimingEnabled:(BOOL)gyroAimingEnabled {
     if (_gyroAimingEnabled == gyroAimingEnabled) return;
     _gyroAimingEnabled = gyroAimingEnabled;
-    _gyroLastTick = MonotonicSeconds();
+    _gyroLastEmitTimestamp = 0;
+    _gyroEmitClockValid = NO;
     _gyroFractionX = 0;
     _gyroFractionY = 0;
     _gyroScrollAccumulator = 0;
@@ -420,7 +413,7 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
         sample.valid = true;
         [self updateGyroCalibration:sample now:now];
         UpdateFusedGravity(sample, previousTimestamp);
-        UpdatePointerRates(sample);
+        UpdatePointerRates(sample, side);
 
         if (sample.rearmPending && !sample.onSurface) {
             const MotionData &m = sample.motion;
@@ -481,6 +474,7 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
         }
         if (_pointerMethod == PointerMethodGyro) {
             [self updateGyroMouseButtons];
+            [self emitGyroPointerForPacketSide:side now:now];
         }
         [self updateGyroCalibrationState];
     }
@@ -578,95 +572,143 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
     }
 }
 
-- (void)emitGyroPointerTick {
-    @synchronized (self) {
-        const double now = MonotonicSeconds();
-        if (_pointerMethod == PointerMethodGyro) {
-            [self updateGyroMouseButtons];
-        }
-        double dt = now - _gyroLastTick;
-        _gyroLastTick = now;
-        if (_pointerMethod != PointerMethodGyro || !_gyroAimingEnabled
-            || _currentMode == MouseModeOff || !_driverClient || ![_driverClient isRunning]) {
-            _gyroFractionX = _gyroFractionY = 0;
-            return;
-        }
-        dt = std::clamp(dt, 0.0, 0.025);
-        int scroll = 0;
-        const bool useLeftStick = _gyroSource != GyroMouseSourceRight
-                               && now - _gyroStickTimestampLeft <= 0.0455;
-        const bool useRightStick = _gyroSource != GyroMouseSourceLeft
-                                && now - _gyroStickTimestampRight <= 0.0455;
-        int stickY = 0;
-        if (useLeftStick) stickY = _gyroStickLeft.y;
-        if (useRightStick && std::abs((int)_gyroStickRight.y) > std::abs(stickY)) {
-            stickY = _gyroStickRight.y;
-        }
-        static const int SCROLL_DEADZONE = 4000;
-        if (std::abs(stickY) > SCROLL_DEADZONE) {
-            const double intensity = (std::abs(stickY) - SCROLL_DEADZONE)
-                                   / (32767.0 - SCROLL_DEADZONE);
-            // Matches the optical path's 40 units/report at 66.67 Hz and
-            // 120 units per wheel click, but remains stable at the 120 Hz timer.
-            static const double MAX_SCROLL_CLICKS_PER_SECOND = 22.222222222222225;
-            _gyroScrollAccumulator += std::copysign(intensity * MAX_SCROLL_CLICKS_PER_SECOND * dt,
-                                                    static_cast<double>(stickY));
-            scroll = ExtractWholeMouseDelta(_gyroScrollAccumulator);
-            _gyroScrollAccumulator -= scroll;
-        } else {
-            _gyroScrollAccumulator = 0;
-        }
-        const bool leftFresh = _gyroLeft.valid && _gyroLeft.surfaceKnown
-                            && !_gyroLeft.onSurface && !_gyroLeft.rearmPending
-                            && now - _gyroLeft.timestamp <= 0.0455;
-        const bool rightFresh = _gyroRight.valid && _gyroRight.surfaceKnown
-                             && !_gyroRight.onSurface && !_gyroRight.rearmPending
-                             && now - _gyroRight.timestamp <= 0.0455;
+- (void)emitGyroPointerForPacketSide:(JoyConSide)side now:(double)now {
+    if (_pointerMethod != PointerMethodGyro || !_gyroAimingEnabled
+        || _currentMode == MouseModeOff || !_driverClient || ![_driverClient isRunning]) {
+        _gyroLastEmitTimestamp = 0;
+        _gyroEmitClockValid = NO;
+        _gyroFractionX = _gyroFractionY = 0;
+        _gyroScrollAccumulator = 0;
+        return;
+    }
 
-        const GyroPointerSample *a = nullptr;
-        const GyroPointerSample *b = nullptr;
-        if (_gyroSource == GyroMouseSourceLeft) {
-            if (leftFresh) a = &_gyroLeft;
-        } else if (_gyroSource == GyroMouseSourceRight) {
-            if (rightFresh) a = &_gyroRight;
-        } else {
-            if (leftFresh) a = &_gyroLeft;
-            if (rightFresh) {
-                if (a) b = &_gyroRight;
-                else a = &_gyroRight;
+    const bool leftFresh = GyroSampleUsable(_gyroLeft, now);
+    const bool rightFresh = GyroSampleUsable(_gyroRight, now);
+    const bool packetSideFresh = side == JoyConSide::Left ? leftFresh : rightFresh;
+
+    JoyConSide clockSide = side;
+    bool haveClock = false;
+    if (_gyroSource == GyroMouseSourceLeft) {
+        if (leftFresh) {
+            clockSide = JoyConSide::Left;
+            haveClock = true;
+        }
+    } else if (_gyroSource == GyroMouseSourceRight) {
+        if (rightFresh) {
+            clockSide = JoyConSide::Right;
+            haveClock = true;
+        }
+    } else {
+        if (_gyroEmitClockValid) {
+            const bool clockFresh = _gyroEmitClockSide == JoyConSide::Left
+                                  ? leftFresh : rightFresh;
+            if (clockFresh) {
+                clockSide = _gyroEmitClockSide;
+                haveClock = true;
             }
         }
-        if (!a) {
-            _gyroActiveSourceName = @"none";
-            _gyroFractionX = _gyroFractionY = 0;
-            if (scroll != 0) [self postMouseReportDeltaX:0 deltaY:0 scroll:scroll];
-            return;
+        if (!haveClock && packetSideFresh) {
+            clockSide = side;
+            haveClock = true;
         }
+    }
 
-        double alignedTimestamp = a->timestamp;
-        if (b) alignedTimestamp = std::min(a->timestamp, b->timestamp);
-        PointerRates rates = PointerRatesAt(*a, alignedTimestamp);
-        double pitch = rates.pitch;
-        double yaw = rates.yaw;
-        if (b) {
-            const PointerRates secondRates = PointerRatesAt(*b, alignedTimestamp);
-            pitch = (pitch + secondRates.pitch) * 0.5;
-            yaw = (yaw + secondRates.yaw) * 0.5;
-            _gyroActiveSourceName = @"fused";
-        } else {
-            _gyroActiveSourceName = a == &_gyroLeft ? @"left" : @"right";
-        }
+    if (!haveClock) {
+        _gyroActiveSourceName = @"none";
+        _gyroLastEmitTimestamp = 0;
+        _gyroEmitClockValid = NO;
+        _gyroFractionX = _gyroFractionY = 0;
+        _gyroScrollAccumulator = 0;
+        return;
+    }
 
-        const double countsPerDegree = GyroCountsPerDegree(_currentMode);
-        _gyroFractionX += -yaw * dt * countsPerDegree;
-        _gyroFractionY += -pitch * dt * countsPerDegree;
-        const int dx = ExtractWholeMouseDelta(_gyroFractionX);
-        const int dy = ExtractWholeMouseDelta(_gyroFractionY);
-        _gyroFractionX -= dx;
-        _gyroFractionY -= dy;
-        if (dx != 0 || dy != 0 || scroll != 0) {
-            [self postMouseReportDeltaX:dx deltaY:dy scroll:scroll];
+    const bool clockChanged = !_gyroEmitClockValid || _gyroEmitClockSide != clockSide;
+    _gyroEmitClockSide = clockSide;
+    _gyroEmitClockValid = YES;
+    if (side != clockSide) return;
+
+    if (clockChanged || _gyroLastEmitTimestamp <= 0) {
+        _gyroLastEmitTimestamp = now;
+        _gyroScrollAccumulator = 0;
+        return;
+    }
+
+    double dt = now - _gyroLastEmitTimestamp;
+    if (dt <= 0) return;
+    _gyroLastEmitTimestamp = now;
+    if (dt > 0.0455) {
+        _gyroFractionX = _gyroFractionY = 0;
+        _gyroScrollAccumulator = 0;
+        return;
+    }
+    dt = std::min(dt, 0.025);
+
+    const GyroPointerSample *a = nullptr;
+    const GyroPointerSample *b = nullptr;
+    if (_gyroSource == GyroMouseSourceLeft) {
+        if (leftFresh) a = &_gyroLeft;
+    } else if (_gyroSource == GyroMouseSourceRight) {
+        if (rightFresh) a = &_gyroRight;
+    } else {
+        if (leftFresh) a = &_gyroLeft;
+        if (rightFresh) {
+            if (a) b = &_gyroRight;
+            else a = &_gyroRight;
         }
+    }
+    if (!a) {
+        _gyroActiveSourceName = @"none";
+        _gyroFractionX = _gyroFractionY = 0;
+        _gyroScrollAccumulator = 0;
+        return;
+    }
+
+    double alignedTimestamp = a->timestamp;
+    if (b) alignedTimestamp = std::min(a->timestamp, b->timestamp);
+    PointerRates rates = PointerRatesAt(*a, alignedTimestamp);
+    double pitch = rates.pitch;
+    double yaw = rates.yaw;
+    if (b) {
+        const PointerRates secondRates = PointerRatesAt(*b, alignedTimestamp);
+        pitch = (pitch + secondRates.pitch) * 0.5;
+        yaw = (yaw + secondRates.yaw) * 0.5;
+        _gyroActiveSourceName = @"fused";
+    } else {
+        _gyroActiveSourceName = a == &_gyroLeft ? @"left" : @"right";
+    }
+
+    int scroll = 0;
+    const bool useLeftStick = _gyroSource != GyroMouseSourceRight
+                           && now - _gyroStickTimestampLeft <= 0.0455;
+    const bool useRightStick = _gyroSource != GyroMouseSourceLeft
+                            && now - _gyroStickTimestampRight <= 0.0455;
+    int stickY = 0;
+    if (useLeftStick) stickY = _gyroStickLeft.y;
+    if (useRightStick && std::abs((int)_gyroStickRight.y) > std::abs(stickY)) {
+        stickY = _gyroStickRight.y;
+    }
+    static const int SCROLL_DEADZONE = 4000;
+    if (std::abs(stickY) > SCROLL_DEADZONE) {
+        const double intensity = (std::abs(stickY) - SCROLL_DEADZONE)
+                               / (32767.0 - SCROLL_DEADZONE);
+        static const double MAX_SCROLL_CLICKS_PER_SECOND = 22.222222222222225;
+        _gyroScrollAccumulator += std::copysign(intensity * MAX_SCROLL_CLICKS_PER_SECOND * dt,
+                                                static_cast<double>(stickY));
+        scroll = ExtractWholeMouseDelta(_gyroScrollAccumulator);
+        _gyroScrollAccumulator -= scroll;
+    } else {
+        _gyroScrollAccumulator = 0;
+    }
+
+    const double countsPerDegree = GyroCountsPerDegree(_currentMode);
+    _gyroFractionX += yaw * dt * countsPerDegree;
+    _gyroFractionY += -pitch * dt * countsPerDegree;
+    const int dx = ExtractWholeMouseDelta(_gyroFractionX);
+    const int dy = ExtractWholeMouseDelta(_gyroFractionY);
+    _gyroFractionX -= dx;
+    _gyroFractionY -= dy;
+    if (dx != 0 || dy != 0 || scroll != 0) {
+        [self postMouseReportDeltaX:dx deltaY:dy scroll:scroll];
     }
 }
 

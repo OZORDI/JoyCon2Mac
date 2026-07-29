@@ -2,8 +2,9 @@ import math
 import unittest
 
 
-TICK_RATE = 120
+NOMINAL_PACKET_RATE = 200.0 / 3.0
 FRESHNESS_SECONDS = 0.0455
+MAX_PACKET_DT = 0.025
 COUNTS_PER_DEGREE = {"slow": 80.0, "normal": 120.0, "fast": 160.0}
 GESTURE_THRESHOLD = 60.0
 GESTURE_KEY_DWELL_SECONDS = 0.040
@@ -32,20 +33,44 @@ def extract_whole(value):
     return math.floor(value + 1e-9) if value >= 0 else math.ceil(value - 1e-9)
 
 
-def integrate_rate(rate_degrees_per_second, seconds, scale):
+def regular_packet_times(seconds, rate=NOMINAL_PACKET_RATE):
+    times = [0.0]
+    interval = 1.0 / rate
+    while times[-1] < seconds:
+        times.append(min(seconds, times[-1] + interval))
+    return times
+
+
+def integrate_packet_rate(rate_degrees_per_second, timestamps, scale):
     fraction = 0.0
     emitted = 0
-    ticks = round(seconds * TICK_RATE)
-    for _ in range(ticks):
-        fraction += rate_degrees_per_second / TICK_RATE * scale
+    previous = timestamps[0]
+    for timestamp in timestamps[1:]:
+        dt = timestamp - previous
+        if dt <= 0:
+            continue
+        previous = timestamp
+        if dt > FRESHNESS_SECONDS:
+            fraction = 0.0
+            continue
+        dt = min(dt, MAX_PACKET_DT)
+        fraction += rate_degrees_per_second * dt * scale
         whole = extract_whole(fraction)
         fraction -= whole
         emitted += whole
     return emitted, fraction
 
 
+def integrate_rate(rate_degrees_per_second, seconds, scale):
+    return integrate_packet_rate(
+        rate_degrees_per_second,
+        regular_packet_times(seconds),
+        scale,
+    )
+
+
 def gyro_pointer_delta(pitch_rate, yaw_rate, seconds, scale):
-    return -yaw_rate * seconds * scale, -pitch_rate * seconds * scale
+    return yaw_rate * seconds * scale, -pitch_rate * seconds * scale
 
 
 def normalize(vector):
@@ -59,6 +84,10 @@ def player_space_yaw(gyro_y, gyro_z, gravity):
     world_yaw = gyro_y * gravity[1] + gyro_z * gravity[2]
     relaxed = min(abs(world_yaw) * math.sqrt(2.0), math.hypot(gyro_y, gyro_z))
     return math.copysign(relaxed, world_yaw) if world_yaw else 0.0
+
+
+def canonical_pointer_yaw(yaw, side):
+    return -yaw if side == "right" else yaw
 
 
 def raw_accel_player_space_yaw(gyro_y, gyro_z, accel):
@@ -139,15 +168,67 @@ def integrate_gyro_scroll(stick_y, seconds):
     intensity = (abs(stick_y) - SCROLL_DEADZONE) / (32767.0 - SCROLL_DEADZONE)
     accumulator = 0.0
     emitted = 0
-    for _ in range(round(seconds * TICK_RATE)):
+    timestamps = regular_packet_times(seconds)
+    for previous, timestamp in zip(timestamps, timestamps[1:]):
+        dt = min(timestamp - previous, MAX_PACKET_DT)
         accumulator += math.copysign(
-            intensity * MAX_SCROLL_CLICKS_PER_SECOND / TICK_RATE,
+            intensity * MAX_SCROLL_CLICKS_PER_SECOND * dt,
             stick_y,
         )
         whole = extract_whole(accumulator)
         accumulator -= whole
         emitted += whole
     return emitted
+
+
+class GyroPacketClock:
+    def __init__(self, source="fused"):
+        self.source = source
+        self.clock_side = None
+        self.last_emit = None
+
+    def packet(self, timestamp, side, left_fresh, right_fresh):
+        have_clock = False
+        clock_side = side
+        if self.source == "left":
+            if left_fresh:
+                clock_side = "left"
+                have_clock = True
+        elif self.source == "right":
+            if right_fresh:
+                clock_side = "right"
+                have_clock = True
+        else:
+            if self.clock_side is not None:
+                clock_fresh = left_fresh if self.clock_side == "left" else right_fresh
+                if clock_fresh:
+                    clock_side = self.clock_side
+                    have_clock = True
+            packet_fresh = left_fresh if side == "left" else right_fresh
+            if not have_clock and packet_fresh:
+                clock_side = side
+                have_clock = True
+
+        if not have_clock:
+            self.clock_side = None
+            self.last_emit = None
+            return None
+
+        changed = self.clock_side != clock_side
+        self.clock_side = clock_side
+        if side != clock_side:
+            return None
+        if changed or self.last_emit is None:
+            self.last_emit = timestamp
+            return None
+
+        dt = timestamp - self.last_emit
+        if dt <= 0:
+            return None
+        self.last_emit = timestamp
+        if dt > FRESHNESS_SECONDS:
+            return None
+        return min(dt, MAX_PACKET_DT)
 
 
 class SurfaceGate:
@@ -181,6 +262,72 @@ class SurfaceGate:
 
 
 class GyroPointerMathTests(unittest.TestCase):
+    def test_nominal_packet_cadence_preserves_integrated_motion(self):
+        timestamps = regular_packet_times(1.0)
+        emitted, fraction = integrate_packet_rate(
+            90.0,
+            timestamps,
+            COUNTS_PER_DEGREE["normal"],
+        )
+        self.assertAlmostEqual(
+            emitted + fraction,
+            90.0 * COUNTS_PER_DEGREE["normal"],
+            places=6,
+        )
+        self.assertEqual(len(timestamps) - 1, 67)
+
+    def test_packet_jitter_preserves_total_motion(self):
+        intervals = [0.014, 0.016, 0.015, 0.017, 0.013] * 12
+        timestamps = [0.0]
+        for interval in intervals:
+            timestamps.append(timestamps[-1] + interval)
+        emitted, fraction = integrate_packet_rate(
+            37.5,
+            timestamps,
+            COUNTS_PER_DEGREE["slow"],
+        )
+        expected = 37.5 * sum(intervals) * COUNTS_PER_DEGREE["slow"]
+        self.assertAlmostEqual(emitted + fraction, expected, places=6)
+
+    def test_fused_packet_clock_emits_once_per_pair(self):
+        clock = GyroPacketClock("fused")
+        events = (
+            (0.0000, "left", True, False),
+            (0.0075, "right", True, True),
+            (0.0150, "left", True, True),
+            (0.0225, "right", True, True),
+            (0.0300, "left", True, True),
+            (0.0375, "right", True, True),
+        )
+        outputs = [
+            (side, dt)
+            for timestamp, side, left_fresh, right_fresh in events
+            if (dt := clock.packet(timestamp, side, left_fresh, right_fresh)) is not None
+        ]
+        self.assertEqual([side for side, _ in outputs], ["left", "left"])
+        self.assertEqual(len(outputs), 2)
+
+    def test_fused_clock_fallback_has_no_handoff_spike(self):
+        clock = GyroPacketClock("fused")
+        self.assertIsNone(clock.packet(0.000, "left", True, False))
+        self.assertAlmostEqual(clock.packet(0.015, "left", True, True), 0.015)
+        self.assertIsNone(clock.packet(0.060, "right", False, True))
+        self.assertAlmostEqual(clock.packet(0.075, "right", False, True), 0.015)
+
+    def test_duplicate_and_out_of_order_packets_do_not_move_clock_backward(self):
+        clock = GyroPacketClock("left")
+        self.assertIsNone(clock.packet(1.000, "left", True, False))
+        self.assertAlmostEqual(clock.packet(1.015, "left", True, False), 0.015)
+        self.assertIsNone(clock.packet(1.015, "left", True, False))
+        self.assertIsNone(clock.packet(1.014, "left", True, False))
+        self.assertAlmostEqual(clock.packet(1.030, "left", True, False), 0.015)
+
+    def test_stale_gap_is_dropped_instead_of_accumulated(self):
+        clock = GyroPacketClock("right")
+        self.assertIsNone(clock.packet(2.000, "right", False, True))
+        self.assertIsNone(clock.packet(2.100, "right", False, True))
+        self.assertAlmostEqual(clock.packet(2.115, "right", False, True), 0.015)
+
     def test_speed_presets_change_speed_not_reachability(self):
         for name, scale in COUNTS_PER_DEGREE.items():
             emitted, fraction = integrate_rate(90.0, 1.0, scale)
@@ -198,8 +345,32 @@ class GyroPointerMathTests(unittest.TestCase):
         self.assertAlmostEqual(fraction, 0.0, places=6)
 
     def test_rightward_yaw_moves_pointer_right(self):
-        dx, _ = gyro_pointer_delta(0.0, -20.0, 0.1, 1.0)
+        dx, _ = gyro_pointer_delta(0.0, 20.0, 0.1, 1.0)
         self.assertGreater(dx, 0.0)
+
+    def test_leftward_yaw_moves_pointer_left(self):
+        dx, _ = gyro_pointer_delta(0.0, -20.0, 0.1, 1.0)
+        self.assertLess(dx, 0.0)
+
+    def test_both_joycons_agree_on_physical_rightward_yaw(self):
+        left_yaw = canonical_pointer_yaw(20.0, "left")
+        right_yaw = canonical_pointer_yaw(-20.0, "right")
+        left_dx, _ = gyro_pointer_delta(0.0, left_yaw, 0.1, 1.0)
+        right_dx, _ = gyro_pointer_delta(0.0, right_yaw, 0.1, 1.0)
+        fused_dx, _ = gyro_pointer_delta(0.0, (left_yaw + right_yaw) * 0.5, 0.1, 1.0)
+        self.assertGreater(left_dx, 0.0)
+        self.assertGreater(right_dx, 0.0)
+        self.assertGreater(fused_dx, 0.0)
+
+    def test_both_joycons_agree_on_physical_leftward_yaw(self):
+        left_yaw = canonical_pointer_yaw(-20.0, "left")
+        right_yaw = canonical_pointer_yaw(20.0, "right")
+        left_dx, _ = gyro_pointer_delta(0.0, left_yaw, 0.1, 1.0)
+        right_dx, _ = gyro_pointer_delta(0.0, right_yaw, 0.1, 1.0)
+        fused_dx, _ = gyro_pointer_delta(0.0, (left_yaw + right_yaw) * 0.5, 0.1, 1.0)
+        self.assertLess(left_dx, 0.0)
+        self.assertLess(right_dx, 0.0)
+        self.assertLess(fused_dx, 0.0)
 
     def test_player_space_yaw_survives_controller_orientation(self):
         root_half = math.sqrt(0.5)
