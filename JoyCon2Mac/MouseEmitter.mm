@@ -124,12 +124,113 @@ static int ExtractWholeMouseDelta(double value) {
 }
 
 static double GyroCountsPerDegree(MouseMode mode) {
-    double displayWidth = CGDisplayBounds(CGMainDisplayID()).size.width;
-    if (displayWidth <= 0) displayWidth = 1920.0;
-    double multiplier = 24.0;
-    if (mode == MouseModeSlow) multiplier = 16.0;
-    else if (mode == MouseModeFast) multiplier = 32.0;
-    return (displayWidth / 360.0) * multiplier;
+    // Relative HID counts are subsequently transformed by macOS pointer
+    // acceleration. Keep device gain independent of display geometry.
+    if (mode == MouseModeSlow) return 80.0;
+    if (mode == MouseModeFast) return 160.0;
+    return 120.0;
+}
+
+static bool NormalizeVector(double &x, double &y, double &z) {
+    const double length = std::sqrt(x * x + y * y + z * z);
+    if (length < 0.0001) return false;
+    x /= length;
+    y /= length;
+    z /= length;
+    return true;
+}
+
+static void UpdateFusedGravity(GyroPointerSample &sample, double previousTimestamp) {
+    double accelX = sample.motion.accelX;
+    double accelY = sample.motion.accelY;
+    double accelZ = sample.motion.accelZ;
+    const double accelMagnitude = std::sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
+    const bool accelValid = NormalizeVector(accelX, accelY, accelZ);
+
+    if (!sample.gravityValid) {
+        if (!accelValid) return;
+        sample.gravityX = accelX;
+        sample.gravityY = accelY;
+        sample.gravityZ = accelZ;
+        sample.gravityValid = true;
+        return;
+    }
+
+    double dt = sample.timestamp - previousTimestamp;
+    if (previousTimestamp <= 0 || dt <= 0 || dt > 0.05) return;
+
+    const double degreesToRadians = M_PI / 180.0;
+    const double omegaX = (sample.motion.gyroX - sample.biasX) * degreesToRadians;
+    const double omegaY = (sample.motion.gyroY - sample.biasY) * degreesToRadians;
+    const double omegaZ = (sample.motion.gyroZ - sample.biasZ) * degreesToRadians;
+    const double crossX = omegaY * sample.gravityZ - omegaZ * sample.gravityY;
+    const double crossY = omegaZ * sample.gravityX - omegaX * sample.gravityZ;
+    const double crossZ = omegaX * sample.gravityY - omegaY * sample.gravityX;
+    sample.gravityX -= crossX * dt;
+    sample.gravityY -= crossY * dt;
+    sample.gravityZ -= crossZ * dt;
+    NormalizeVector(sample.gravityX, sample.gravityY, sample.gravityZ);
+
+    if (!accelValid || std::fabs(accelMagnitude - 1.0) >= 0.10) return;
+    const double alignment = std::clamp(sample.gravityX * accelX
+                                      + sample.gravityY * accelY
+                                      + sample.gravityZ * accelZ, -1.0, 1.0);
+    const double errorAngle = std::acos(alignment);
+    const double correctionLimit = 10.0 * degreesToRadians;
+    if (errorAngle >= correctionLimit) return;
+
+    // Correct integration drift only when acceleration agrees with predicted
+    // gravity. Translational hand acceleration must not steer the pointer.
+    const double confidence = 1.0 - errorAngle / correctionLimit;
+    const double correction = std::clamp(dt * 4.0 * confidence, 0.0, 1.0);
+    sample.gravityX += (accelX - sample.gravityX) * correction;
+    sample.gravityY += (accelY - sample.gravityY) * correction;
+    sample.gravityZ += (accelZ - sample.gravityZ) * correction;
+    NormalizeVector(sample.gravityX, sample.gravityY, sample.gravityZ);
+}
+
+static void UpdatePointerRates(GyroPointerSample &sample) {
+    if (!sample.gravityValid) return;
+    const double gyroX = sample.motion.gyroX - sample.biasX;
+    const double gyroY = sample.motion.gyroY - sample.biasY;
+    const double gyroZ = sample.motion.gyroZ - sample.biasZ;
+    const double worldYaw = gyroY * sample.gravityY + gyroZ * sample.gravityZ;
+    const double relaxedYaw = std::min(std::fabs(worldYaw) * std::sqrt(2.0),
+                                       std::hypot(gyroY, gyroZ));
+    const double playerYaw = worldYaw == 0 ? 0 : std::copysign(relaxedYaw, worldYaw);
+
+    if (sample.rateHistoryCount == 4) {
+        for (uint8_t index = 1; index < 4; ++index) {
+            sample.rateHistory[index - 1] = sample.rateHistory[index];
+        }
+        sample.rateHistoryCount = 3;
+    }
+    sample.rateHistory[sample.rateHistoryCount++] = {sample.timestamp, gyroX, playerYaw};
+}
+
+struct PointerRates {
+    double pitch;
+    double yaw;
+};
+
+static PointerRates PointerRatesAt(const GyroPointerSample &sample, double timestamp) {
+    if (sample.rateHistoryCount == 0) return {0, 0};
+    const GyroPointerRate &oldest = sample.rateHistory[0];
+    if (timestamp <= oldest.timestamp) return {oldest.pitch, oldest.yaw};
+    for (uint8_t index = 1; index < sample.rateHistoryCount; ++index) {
+        const GyroPointerRate &previous = sample.rateHistory[index - 1];
+        const GyroPointerRate &current = sample.rateHistory[index];
+        if (timestamp > current.timestamp) continue;
+        const double span = current.timestamp - previous.timestamp;
+        if (span <= 0) return {current.pitch, current.yaw};
+        const double amount = (timestamp - previous.timestamp) / span;
+        return {
+            previous.pitch + (current.pitch - previous.pitch) * amount,
+            previous.yaw + (current.yaw - previous.yaw) * amount,
+        };
+    }
+    const GyroPointerRate &newest = sample.rateHistory[sample.rateHistoryCount - 1];
+    return {newest.pitch, newest.yaw};
 }
 
 @implementation MouseEmitter
@@ -297,10 +398,13 @@ static double GyroCountsPerDegree(MouseMode mode) {
     uint32_t consumedMask = 0;
     @synchronized (self) {
         GyroPointerSample &sample = side == JoyConSide::Left ? _gyroLeft : _gyroRight;
+        const double previousTimestamp = sample.timestamp;
         sample.motion = CanonicalGyroMotion(motion, side);
         sample.timestamp = now;
         sample.valid = true;
         [self updateGyroCalibration:sample now:now];
+        UpdateFusedGravity(sample, previousTimestamp);
+        UpdatePointerRates(sample);
 
         if (sample.rearmPending && !sample.onSurface) {
             const MotionData &m = sample.motion;
@@ -365,6 +469,13 @@ static double GyroCountsPerDegree(MouseMode mode) {
     const double gyroLimit = sample.manualPending ? 5.0 : 0.5;
     const bool stationary = std::fabs(accelMagnitude - 1.0) < 0.12
                          && gyroMagnitude < gyroLimit;
+    if (sample.biasValid && !sample.manualPending
+        && (!sample.surfaceKnown || !sample.onSurface)) {
+        sample.stationaryStart = 0;
+        sample.stationarySamples = 0;
+        sample.sumX = sample.sumY = sample.sumZ = 0;
+        return;
+    }
     if (!stationary) {
         sample.stationaryStart = 0;
         sample.stationarySamples = 0;
@@ -478,34 +589,13 @@ static double GyroCountsPerDegree(MouseMode mode) {
             return;
         }
 
-        struct PointerRates {
-            double pitch;
-            double yaw;
-        };
-        auto playerSpaceRates = [](const GyroPointerSample *sample) -> PointerRates {
-            const double gyroX = sample->motion.gyroX - sample->biasX;
-            const double gyroY = sample->motion.gyroY - sample->biasY;
-            const double gyroZ = sample->motion.gyroZ - sample->biasZ;
-            const double gravityLength = std::sqrt(sample->motion.accelX * sample->motion.accelX
-                                                 + sample->motion.accelY * sample->motion.accelY
-                                                 + sample->motion.accelZ * sample->motion.accelZ);
-            if (gravityLength < 0.1) return {gyroX, gyroZ};
-
-            const double gravityY = sample->motion.accelY / gravityLength;
-            const double gravityZ = sample->motion.accelZ / gravityLength;
-            const double worldYaw = gyroY * gravityY + gyroZ * gravityZ;
-            const double relaxedYaw = std::min(std::fabs(worldYaw) * std::sqrt(2.0),
-                                               std::hypot(gyroY, gyroZ));
-            const double playerYaw = worldYaw == 0
-                                   ? 0
-                                   : std::copysign(relaxedYaw, worldYaw);
-            return {gyroX, playerYaw};
-        };
-        PointerRates rates = playerSpaceRates(a);
+        double alignedTimestamp = a->timestamp;
+        if (b) alignedTimestamp = std::min(a->timestamp, b->timestamp);
+        PointerRates rates = PointerRatesAt(*a, alignedTimestamp);
         double pitch = rates.pitch;
         double yaw = rates.yaw;
         if (b) {
-            const PointerRates secondRates = playerSpaceRates(b);
+            const PointerRates secondRates = PointerRatesAt(*b, alignedTimestamp);
             pitch = (pitch + secondRates.pitch) * 0.5;
             yaw = (yaw + secondRates.yaw) * 0.5;
             _gyroActiveSourceName = @"fused";
@@ -590,17 +680,33 @@ static double GyroCountsPerDegree(MouseMode mode) {
     }
 
     GyroPointerSample &gyroSample = side == JoyConSide::Left ? _gyroLeft : _gyroRight;
-    const bool onSurface = mouseDistance == 0;
-    if (!gyroSample.surfaceKnown || onSurface != gyroSample.onSurface) {
-        gyroSample.rearmPending = onSurface || gyroSample.onSurface;
-        gyroSample.rearmStillStart = 0;
+    static const uint8_t GYRO_SURFACE_CONFIRM_FRAMES = 3;
+    if (mouseDistance == 0) {
+        gyroSample.airFrames = 0;
+        if (gyroSample.surfaceFrames < GYRO_SURFACE_CONFIRM_FRAMES) {
+            gyroSample.surfaceFrames += 1;
+        }
+        if (gyroSample.surfaceFrames >= GYRO_SURFACE_CONFIRM_FRAMES
+            && (!gyroSample.surfaceKnown || !gyroSample.onSurface)) {
+            gyroSample.surfaceKnown = true;
+            gyroSample.onSurface = true;
+            gyroSample.rearmPending = true;
+            gyroSample.rearmStillStart = 0;
+        }
+    } else {
+        gyroSample.surfaceFrames = 0;
+        if (gyroSample.airFrames < GYRO_SURFACE_CONFIRM_FRAMES) {
+            gyroSample.airFrames += 1;
+        }
+        if (gyroSample.airFrames >= GYRO_SURFACE_CONFIRM_FRAMES
+            && (!gyroSample.surfaceKnown || gyroSample.onSurface)) {
+            const bool wasOnSurface = gyroSample.surfaceKnown && gyroSample.onSurface;
+            gyroSample.surfaceKnown = true;
+            gyroSample.onSurface = false;
+            gyroSample.rearmPending = wasOnSurface;
+            gyroSample.rearmStillStart = 0;
+        }
     }
-    if (onSurface) {
-        gyroSample.rearmPending = true;
-        gyroSample.rearmStillStart = 0;
-    }
-    gyroSample.surfaceKnown = true;
-    gyroSample.onSurface = onSurface;
 
     // Update `lastActiveSide` in Auto mode so the UI badge is correct
     // regardless of the mouse emitter's on/off state. With manual Left /

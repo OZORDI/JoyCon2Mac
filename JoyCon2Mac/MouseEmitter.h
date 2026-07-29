@@ -38,9 +38,20 @@ typedef NS_ENUM(NSInteger, GyroMouseSource) {
     GyroMouseSourceRight = 2
 };
 
+struct GyroPointerRate {
+    double timestamp = 0;
+    double pitch = 0;
+    double yaw = 0;
+};
+
 struct GyroPointerSample {
     MotionData motion = {0, 0, 0, 0, 0, 0};
     double timestamp = 0;
+    GyroPointerRate rateHistory[4] = {};
+    uint8_t rateHistoryCount = 0;
+    double gravityX = 0;
+    double gravityY = 0;
+    double gravityZ = 0;
     float biasX = 0;
     float biasY = 0;
     float biasZ = 0;
@@ -52,10 +63,13 @@ struct GyroPointerSample {
     bool valid = false;
     bool biasValid = false;
     bool manualPending = false;
+    bool gravityValid = false;
     bool surfaceKnown = false;
     bool onSurface = false;
     bool rearmPending = false;
     double rearmStillStart = 0;
+    uint8_t surfaceFrames = 0;
+    uint8_t airFrames = 0;
 };
 
 @interface MouseEmitter : NSObject {

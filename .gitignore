@@ -35,6 +35,10 @@ DerivedData/
 *.swo
 *~
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Logs
 *.log
 joycon1 ref projects/
