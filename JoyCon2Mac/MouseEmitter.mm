@@ -257,10 +257,17 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
         _gyroFractionY = 0;
         _gyroTogglePressedLeft = NO;
         _gyroTogglePressedRight = NO;
+        _gyroLastToggleTapLeft = 0;
+        _gyroLastToggleTapRight = 0;
         _gyroButtonStateLeft = 0;
         _gyroButtonStateRight = 0;
         _gyroButtonTimestampLeft = 0;
         _gyroButtonTimestampRight = 0;
+        _gyroStickLeft = {0, 0, 0, 0};
+        _gyroStickRight = {0, 0, 0, 0};
+        _gyroStickTimestampLeft = 0;
+        _gyroStickTimestampRight = 0;
+        _gyroScrollAccumulator = 0;
         _lastActiveSide = JoyConSide::Right;
         _lastDistanceLeft = 0;
         _lastDistanceRight = 0;
@@ -343,6 +350,7 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
     _gyroLastTick = MonotonicSeconds();
     _gyroFractionX = 0;
     _gyroFractionY = 0;
+    _gyroScrollAccumulator = 0;
     if (!gyroAimingEnabled) {
         _gyroActiveSourceName = @"none";
         [self releaseAllMouseButtons];
@@ -352,21 +360,28 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
 - (void)setLeftGyroToggleBinding:(NSString *)binding {
     _leftGyroToggleBinding = [binding copy];
     _gyroTogglePressedLeft = NO;
+    _gyroLastToggleTapLeft = 0;
 }
 
 - (void)setRightGyroToggleBinding:(NSString *)binding {
     _rightGyroToggleBinding = [binding copy];
     _gyroTogglePressedRight = NO;
+    _gyroLastToggleTapRight = 0;
 }
 
 - (void)resetGyroAiming {
     self.gyroAimingEnabled = NO;
     _gyroTogglePressedLeft = NO;
     _gyroTogglePressedRight = NO;
+    _gyroLastToggleTapLeft = 0;
+    _gyroLastToggleTapRight = 0;
     _gyroButtonStateLeft = 0;
     _gyroButtonStateRight = 0;
     _gyroButtonTimestampLeft = 0;
     _gyroButtonTimestampRight = 0;
+    _gyroStickTimestampLeft = 0;
+    _gyroStickTimestampRight = 0;
+    _gyroScrollAccumulator = 0;
 }
 
 - (void)requestGyroCalibration {
@@ -393,7 +408,8 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
 
 - (uint32_t)processGyroMotion:(MotionData)motion
                          side:(JoyConSide)side
-                  buttonState:(uint32_t)buttonState {
+                  buttonState:(uint32_t)buttonState
+                 stickReading:(StickData)stickReading {
     const double now = MonotonicSeconds();
     uint32_t consumedMask = 0;
     @synchronized (self) {
@@ -436,8 +452,17 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
             BOOL *wasPressed = side == JoyConSide::Left
                                  ? &_gyroTogglePressedLeft
                                  : &_gyroTogglePressedRight;
+            double *lastTap = side == JoyConSide::Left
+                                ? &_gyroLastToggleTapLeft
+                                : &_gyroLastToggleTapRight;
             if (pressed && !*wasPressed) {
-                self.gyroAimingEnabled = !self.gyroAimingEnabled;
+                static const double DOUBLE_TAP_SECONDS = 0.35;
+                if (*lastTap > 0 && now - *lastTap <= DOUBLE_TAP_SECONDS) {
+                    *lastTap = 0;
+                    self.gyroAimingEnabled = !self.gyroAimingEnabled;
+                } else {
+                    *lastTap = now;
+                }
             }
             *wasPressed = pressed;
             if (pressed) consumedMask = mask;
@@ -446,9 +471,13 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
         if (side == JoyConSide::Left) {
             _gyroButtonStateLeft = buttonState;
             _gyroButtonTimestampLeft = now;
+            _gyroStickLeft = stickReading;
+            _gyroStickTimestampLeft = now;
         } else {
             _gyroButtonStateRight = buttonState;
             _gyroButtonTimestampRight = now;
+            _gyroStickRight = stickReading;
+            _gyroStickTimestampRight = now;
         }
         if (_pointerMethod == PointerMethodGyro) {
             [self updateGyroMouseButtons];
@@ -563,6 +592,30 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
             return;
         }
         dt = std::clamp(dt, 0.0, 0.025);
+        int scroll = 0;
+        const bool useLeftStick = _gyroSource != GyroMouseSourceRight
+                               && now - _gyroStickTimestampLeft <= 0.0455;
+        const bool useRightStick = _gyroSource != GyroMouseSourceLeft
+                                && now - _gyroStickTimestampRight <= 0.0455;
+        int stickY = 0;
+        if (useLeftStick) stickY = _gyroStickLeft.y;
+        if (useRightStick && std::abs((int)_gyroStickRight.y) > std::abs(stickY)) {
+            stickY = _gyroStickRight.y;
+        }
+        static const int SCROLL_DEADZONE = 4000;
+        if (std::abs(stickY) > SCROLL_DEADZONE) {
+            const double intensity = (std::abs(stickY) - SCROLL_DEADZONE)
+                                   / (32767.0 - SCROLL_DEADZONE);
+            // Matches the optical path's 40 units/report at 66.67 Hz and
+            // 120 units per wheel click, but remains stable at the 120 Hz timer.
+            static const double MAX_SCROLL_CLICKS_PER_SECOND = 22.222222222222225;
+            _gyroScrollAccumulator += std::copysign(intensity * MAX_SCROLL_CLICKS_PER_SECOND * dt,
+                                                    static_cast<double>(stickY));
+            scroll = ExtractWholeMouseDelta(_gyroScrollAccumulator);
+            _gyroScrollAccumulator -= scroll;
+        } else {
+            _gyroScrollAccumulator = 0;
+        }
         const bool leftFresh = _gyroLeft.valid && _gyroLeft.surfaceKnown
                             && !_gyroLeft.onSurface && !_gyroLeft.rearmPending
                             && now - _gyroLeft.timestamp <= 0.0455;
@@ -586,6 +639,7 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
         if (!a) {
             _gyroActiveSourceName = @"none";
             _gyroFractionX = _gyroFractionY = 0;
+            if (scroll != 0) [self postMouseReportDeltaX:0 deltaY:0 scroll:scroll];
             return;
         }
 
@@ -610,8 +664,8 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
         const int dy = ExtractWholeMouseDelta(_gyroFractionY);
         _gyroFractionX -= dx;
         _gyroFractionY -= dy;
-        if (dx != 0 || dy != 0) {
-            [self postMouseReportDeltaX:dx deltaY:dy scroll:0];
+        if (dx != 0 || dy != 0 || scroll != 0) {
+            [self postMouseReportDeltaX:dx deltaY:dy scroll:scroll];
         }
     }
 }
@@ -1075,8 +1129,19 @@ static PointerRates PointerRatesAt(const GyroPointerSample &sample, double times
     pressed.keys[0] = usage;
     [_driverClient postKeyboardReport:pressed];
 
-    struct JoyConKeyboardReportData released = {};
-    [_driverClient postKeyboardReport:released];
+    // Keep the chord down long enough for the HID event system to observe it
+    // as a real key press instead of coalescing adjacent press/release reports.
+    __weak MouseEmitter *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        MouseEmitter *strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.driverClient ||
+            ![strongSelf.driverClient isRunning]) {
+            return;
+        }
+        struct JoyConKeyboardReportData released = {};
+        [strongSelf.driverClient postKeyboardReport:released];
+    });
 }
 
 @end

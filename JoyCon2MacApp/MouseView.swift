@@ -205,6 +205,10 @@ struct MouseView: View {
                         }
                     }
                 }
+
+                Text("Quickly double-press either selected button to start or stop Gyro Aiming.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
         }
     }

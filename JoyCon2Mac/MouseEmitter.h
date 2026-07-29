@@ -82,10 +82,17 @@ struct GyroPointerSample {
     double _gyroFractionY;
     BOOL _gyroTogglePressedLeft;
     BOOL _gyroTogglePressedRight;
+    double _gyroLastToggleTapLeft;
+    double _gyroLastToggleTapRight;
     uint32_t _gyroButtonStateLeft;
     uint32_t _gyroButtonStateRight;
     double _gyroButtonTimestampLeft;
     double _gyroButtonTimestampRight;
+    StickData _gyroStickLeft;
+    StickData _gyroStickRight;
+    double _gyroStickTimestampLeft;
+    double _gyroStickTimestampRight;
+    double _gyroScrollAccumulator;
     NSString *_gyroActiveSourceName;
     BOOL _gyroCalibrating;
     BOOL _opticalGestureChordActive;
@@ -133,7 +140,8 @@ struct GyroPointerSample {
 // or zero when no gamepad button needs suppressing.
 - (uint32_t)processGyroMotion:(MotionData)motion
                          side:(JoyConSide)side
-                  buttonState:(uint32_t)buttonState;
+                  buttonState:(uint32_t)buttonState
+                 stickReading:(StickData)stickReading;
 
 - (void)requestGyroCalibration;
 - (void)resetGyroAiming;

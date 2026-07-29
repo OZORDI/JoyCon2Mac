@@ -38,7 +38,9 @@ struct ControllerState {
     MouseData mouseRight = {0, 0, 0};
     // Single "mouse" field preserved for the legacy printDetailedState().
     MouseData mouse = {0, 0, 0};
-    BatteryData battery = {0, 0, 0, -1};
+    BatteryData battery;
+    BatteryData batteryLeft;
+    BatteryData batteryRight;
     uint8_t triggerL = 0;
     uint8_t triggerR = 0;
     uint32_t packetCount = 0;
@@ -810,7 +812,7 @@ void printDetailedState() {
     std::cout << "\nBattery:\n";
     std::cout << "  Voltage: " << g_state.battery.voltage << "V\n";
     std::cout << "  Current: " << g_state.battery.current << "mA\n";
-    std::cout << "  Temp: " << g_state.battery.temperature << "°C\n";
+    std::cout << "  Controller temp: " << g_state.battery.temperature << "°C\n";
     
     std::cout << "===================================\n\n";
 }
@@ -851,6 +853,7 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
     // cube that doesn't match the physical Joy-Con" symptom.
     const MotionData &sideMotion = side == JoyConSide::Right ? g_state.motionRight : g_state.motionLeft;
     const MouseData &sideMouse = side == JoyConSide::Right ? g_state.mouseRight : g_state.mouseLeft;
+    const BatteryData &sideBattery = side == JoyConSide::Right ? g_state.batteryRight : g_state.batteryLeft;
     int mouseMode = g_mouseEmitter ? (int)g_mouseEmitter.currentMode : 0;
     int mouseSource = g_mouseEmitter ? (int)g_mouseEmitter.source : 0;
     const char *mouseActive = g_mouseEmitter && g_mouseEmitter.lastActiveSide == JoyConSide::Left ? "left" : "right";
@@ -886,10 +889,15 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
         << "\"mouseX\":" << sideMouse.deltaX << ","
         << "\"mouseY\":" << sideMouse.deltaY << ","
         << "\"mouseDistance\":" << sideMouse.distance << ","
-        << "\"batteryVoltage\":" << g_state.battery.voltage << ","
-        << "\"batteryCurrent\":" << g_state.battery.current << ","
-        << "\"batteryTemperature\":" << g_state.battery.temperature << ","
-        << "\"batteryPercentage\":" << g_state.battery.percentage << ","
+        << "\"batteryVoltage\":" << sideBattery.voltage << ","
+        << "\"batteryCurrent\":" << sideBattery.current << ","
+        << "\"batteryTemperature\":" << sideBattery.temperature << ","
+        << "\"controllerTemperature\":" << sideBattery.temperature << ","
+        << "\"batteryPercentage\":" << sideBattery.percentage << ","
+        << "\"batteryChargeStatus\":" << (int)sideBattery.chargeStatus << ","
+        << "\"batteryVoltageValid\":" << (sideBattery.voltageValid ? "true" : "false") << ","
+        << "\"batteryCurrentValid\":" << (sideBattery.currentValid ? "true" : "false") << ","
+        << "\"controllerTemperatureValid\":" << (sideBattery.temperatureValid ? "true" : "false") << ","
         << "\"triggerL\":" << (int)g_state.triggerL << ","
         << "\"triggerR\":" << (int)g_state.triggerR << ","
         << "\"mouseMode\":" << mouseMode << ","
@@ -966,12 +974,21 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         g_state.mouse       = g_state.mouseRight;
     }
     MotionData sideMotion = side == JoyConSide::Left ? g_state.motionLeft : g_state.motionRight;
+    StickData gyroStick = side == JoyConSide::Left ? g_state.leftStick : g_state.rightStick;
     uint32_t gyroConsumedMask = g_mouseEmitter
-        ? [g_mouseEmitter processGyroMotion:sideMotion side:side buttonState:sideButtons]
+        ? [g_mouseEmitter processGyroMotion:sideMotion
+                                      side:side
+                               buttonState:sideButtons
+                              stickReading:gyroStick]
         : 0;
     if (side == JoyConSide::Left) g_gyroConsumedLeft = gyroConsumedMask;
     else g_gyroConsumedRight = gyroConsumedMask;
     g_state.battery = DecodeBattery(buffer);
+    if (side == JoyConSide::Left) {
+        g_state.batteryLeft = g_state.battery;
+    } else {
+        g_state.batteryRight = g_state.battery;
+    }
     auto triggers = DecodeAnalogTriggers(buffer);
     // Only update the trigger for the side that sent this packet.
     // Otherwise a left packet (with 0 at offset 0x3D) would zero out

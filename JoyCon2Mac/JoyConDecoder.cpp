@@ -190,33 +190,53 @@ std::pair<int16_t, int16_t> GetRawOpticalMouse(const std::vector<uint8_t>& buffe
 
 BatteryData DecodeBattery(const std::vector<uint8_t>& buffer) {
     if (buffer.size() < 0x30) {
-        return { 0, 0, 0, -1 };
+        return {};
     }
 
-    // Battery voltage at 0x1C (1000 = 1V)
-    uint16_t voltage_raw = (buffer[0x1D] << 8) | buffer[0x1C];
-    float voltage = voltage_raw / 1000.0f;
-    if (voltage < 3.0f || voltage > 5.5f) {
-        voltage = 0.0f;
-    }
+    // Switch 2 common input report:
+    //   0x1F..0x20: battery voltage, little-endian millivolts
+    //   0x21:       raw charge status
+    //   0x22..0x23: battery current, little-endian 1/100 mA
+    //   0x2E..0x2F: signed controller temperature sample
+    //
+    // Bytes 0x1F..0x20 are a voltage, not a 12-bit state-of-charge value.
+    // Joy-Con 2's BEE-004 pack is rated at 3.89 V. The firmware does not
+    // expose a percentage, so estimate one around that nominal midpoint.
+    // This remains an approximation until a full discharge curve is captured.
+    constexpr float kEmptyVoltage = 3.0f;
+    constexpr float kNominalVoltage = 3.89f;
+    constexpr float kFullVoltage = 4.45f;
+    const uint16_t voltageRaw =
+        static_cast<uint16_t>(buffer[0x1F]) |
+        static_cast<uint16_t>(static_cast<uint16_t>(buffer[0x20]) << 8);
+    const uint16_t currentRaw =
+        static_cast<uint16_t>(buffer[0x22]) |
+        static_cast<uint16_t>(static_cast<uint16_t>(buffer[0x23]) << 8);
+    const int16_t temperatureRaw = to_signed_16(buffer[0x2E], buffer[0x2F]);
 
-    // Battery current at 0x1E (100 = 1mA)
-    uint16_t current_raw = (buffer[0x1F] << 8) | buffer[0x1E];
-    float current = current_raw / 100.0f;
-
-    // Temperature at 0x2E (25°C + raw/127)
-    uint16_t temp_raw = (buffer[0x2F] << 8) | buffer[0x2E];
-    float temperature = 25.0f + (temp_raw / 127.0f);
-
-    float percentage = -1.0f;
-    if (buffer.size() > 0x20) {
-        uint16_t level_raw = (buffer[0x20] << 8) | buffer[0x1F];
-        if (level_raw > 0) {
-            percentage = std::clamp((level_raw * 100.0f) / 4095.0f, 0.0f, 100.0f);
+    BatteryData battery;
+    battery.voltage = static_cast<float>(voltageRaw) / 1000.0f;
+    battery.current = static_cast<float>(currentRaw) / 100.0f;
+    battery.temperature = 25.0f + static_cast<float>(temperatureRaw) / 127.0f;
+    if (voltageRaw != 0) {
+        if (battery.voltage <= kNominalVoltage) {
+            battery.percentage =
+                std::clamp((battery.voltage - kEmptyVoltage) /
+                               (kNominalVoltage - kEmptyVoltage) * 50.0f,
+                           0.0f, 50.0f);
+        } else {
+            battery.percentage =
+                std::clamp(50.0f +
+                               (battery.voltage - kNominalVoltage) /
+                                   (kFullVoltage - kNominalVoltage) * 50.0f,
+                           50.0f, 100.0f);
         }
     }
-
-    return { voltage, current, temperature, percentage };
+    battery.chargeStatus = buffer[0x21];
+    battery.voltageValid = voltageRaw != 0;
+    battery.currentValid = currentRaw != 0;
+    battery.temperatureValid = true;
+    return battery;
 }
 
 std::pair<uint8_t, uint8_t> DecodeAnalogTriggers(const std::vector<uint8_t>& buffer) {

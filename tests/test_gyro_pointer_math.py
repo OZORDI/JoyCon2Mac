@@ -6,8 +6,18 @@ TICK_RATE = 120
 FRESHNESS_SECONDS = 0.0455
 COUNTS_PER_DEGREE = {"slow": 80.0, "normal": 120.0, "fast": 160.0}
 GESTURE_THRESHOLD = 60.0
+GESTURE_KEY_DWELL_SECONDS = 0.040
+CONTROL_ARROW_USAGES = {
+    "right": 0x4F,
+    "left": 0x50,
+    "down": 0x51,
+    "up": 0x52,
+}
 GYRO_REARM_SECONDS = 0.15
 SURFACE_CONFIRM_FRAMES = 3
+DOUBLE_TAP_SECONDS = 0.35
+SCROLL_DEADZONE = 4000
+MAX_SCROLL_CLICKS_PER_SECOND = 40.0 * (200.0 / 3.0) / 120.0
 
 
 def optical_gesture_direction(x, y):
@@ -109,6 +119,35 @@ def clamp_cursor(position, delta, bounds):
         max(0, min(limit, coordinate + movement))
         for coordinate, movement, limit in zip(position, delta, bounds)
     )
+
+
+def double_tap_edges(edge_times):
+    last_tap = None
+    toggles = 0
+    for timestamp in edge_times:
+        if last_tap is not None and timestamp - last_tap <= DOUBLE_TAP_SECONDS:
+            toggles += 1
+            last_tap = None
+        else:
+            last_tap = timestamp
+    return toggles
+
+
+def integrate_gyro_scroll(stick_y, seconds):
+    if abs(stick_y) <= SCROLL_DEADZONE:
+        return 0
+    intensity = (abs(stick_y) - SCROLL_DEADZONE) / (32767.0 - SCROLL_DEADZONE)
+    accumulator = 0.0
+    emitted = 0
+    for _ in range(round(seconds * TICK_RATE)):
+        accumulator += math.copysign(
+            intensity * MAX_SCROLL_CLICKS_PER_SECOND / TICK_RATE,
+            stick_y,
+        )
+        whole = extract_whole(accumulator)
+        accumulator -= whole
+        emitted += whole
+    return emitted
 
 
 class SurfaceGate:
@@ -278,6 +317,21 @@ class GyroPointerMathTests(unittest.TestCase):
         self.assertTrue(now - (now - FRESHNESS_SECONDS + 0.0001) <= FRESHNESS_SECONDS)
         self.assertFalse(now - (now - FRESHNESS_SECONDS - 0.001) <= FRESHNESS_SECONDS)
 
+    def test_single_toggle_press_does_nothing(self):
+        self.assertEqual(double_tap_edges([10.0]), 0)
+
+    def test_rapid_double_tap_toggles_once(self):
+        self.assertEqual(double_tap_edges([10.0, 10.30]), 1)
+
+    def test_slow_second_press_starts_a_new_pair(self):
+        self.assertEqual(double_tap_edges([10.0, 10.36]), 0)
+        self.assertEqual(double_tap_edges([10.0, 10.36, 10.60]), 1)
+
+    def test_gyro_stick_scroll_matches_optical_direction_and_rate(self):
+        self.assertEqual(integrate_gyro_scroll(32767, 1.0), 22)
+        self.assertEqual(integrate_gyro_scroll(-32767, 1.0), -22)
+        self.assertEqual(integrate_gyro_scroll(SCROLL_DEADZONE, 1.0), 0)
+
     def test_pickup_requires_short_stationary_rearm(self):
         self.assertFalse(0.149 >= GYRO_REARM_SECONDS)
         self.assertTrue(0.150 >= GYRO_REARM_SECONDS)
@@ -288,6 +342,16 @@ class GyroPointerMathTests(unittest.TestCase):
         self.assertEqual(optical_gesture_direction(80.0, 20.0), "right")
         self.assertEqual(optical_gesture_direction(20.0, -80.0), "up")
         self.assertEqual(optical_gesture_direction(20.0, 80.0), "down")
+
+    def test_optical_gesture_uses_hid_keyboard_arrow_usages(self):
+        self.assertEqual(CONTROL_ARROW_USAGES["right"], 0x4F)
+        self.assertEqual(CONTROL_ARROW_USAGES["left"], 0x50)
+        self.assertEqual(CONTROL_ARROW_USAGES["down"], 0x51)
+        self.assertEqual(CONTROL_ARROW_USAGES["up"], 0x52)
+
+    def test_keyboard_chord_has_observable_key_dwell(self):
+        self.assertGreaterEqual(GESTURE_KEY_DWELL_SECONDS, 0.020)
+        self.assertLessEqual(GESTURE_KEY_DWELL_SECONDS, 0.100)
 
 
 if __name__ == "__main__":

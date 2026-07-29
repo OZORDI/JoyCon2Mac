@@ -61,10 +61,14 @@ struct MouseData {
 };
 
 struct BatteryData {
-    float voltage;      // volts
-    float current;      // milliamps
-    float temperature;  // celsius
-    float percentage;   // 0-100, negative if unavailable
+    float voltage = 0.0f;      // volts
+    float current = 0.0f;      // milliamps
+    float temperature = 0.0f;  // controller sensor, celsius
+    float percentage = -1.0f;  // estimated from voltage; negative if unavailable
+    uint8_t chargeStatus = 0;   // raw protocol value; semantics are not yet known
+    bool voltageValid = false;
+    bool currentValid = false;
+    bool temperatureValid = false;
 };
 
 // Button extraction

@@ -4,6 +4,7 @@ project(JoyCon2Mac)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0")
+include(CTest)
 
 # Require Xcode generator if we are building the driverkit extension
 if(NOT CMAKE_GENERATOR STREQUAL "Xcode")
@@ -145,6 +146,17 @@ endif()
 set_target_properties(joycon2mac PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+if(BUILD_TESTING)
+    add_executable(joycon_decoder_tests
+        tests/JoyConDecoderTests.cpp
+        JoyCon2Mac/JoyConDecoder.cpp
+    )
+    target_include_directories(joycon_decoder_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/JoyCon2Mac
+    )
+    add_test(NAME joycon_decoder_tests COMMAND joycon_decoder_tests)
+endif()
 
 message(STATUS "Building JoyCon2Mac - Phases 1-5")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")

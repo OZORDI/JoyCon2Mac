@@ -12,8 +12,12 @@ struct ControllerState: Identifiable {
     var status: String
     var batteryVoltage: Double
     var batteryCurrent: Double
-    var batteryTemperature: Double
+    var controllerTemperature: Double
     var batteryPercentage: Double
+    var batteryChargeStatus: UInt8
+    var batteryVoltageValid: Bool
+    var batteryCurrentValid: Bool
+    var controllerTemperatureValid: Bool
     var buttons: UInt32
     var leftButtons: UInt32
     var rightButtons: UInt32
@@ -454,7 +458,7 @@ class DaemonBridge: ObservableObject {
             FileManager.default.createFile(atPath: url.path, contents: nil)
         }
         traceFileHandle = try? FileHandle(forWritingTo: url)
-        try? traceFileHandle?.seekToEnd()
+        _ = try? traceFileHandle?.seekToEnd()
     }
 
     private func writeTrace(_ line: String) {
@@ -992,6 +996,18 @@ class DaemonBridge: ObservableObject {
     private func buildControllerState(from object: [String: Any]) -> ControllerState {
         let side = stringValue(object["side"], default: "left")
         let normalizedSide = side == "right" ? "right" : "left"
+        let batteryVoltage = doubleValue(object["batteryVoltage"])
+        let batteryCurrent = doubleValue(object["batteryCurrent"])
+        let controllerTemperature = doubleValue(
+            object["controllerTemperature"] ?? object["batteryTemperature"]
+        )
+        let batteryVoltageValid =
+            (object["batteryVoltageValid"] as? NSNumber)?.boolValue ?? (batteryVoltage > 0)
+        let batteryCurrentValid =
+            (object["batteryCurrentValid"] as? NSNumber)?.boolValue ?? (batteryCurrent > 0)
+        let controllerTemperatureValid =
+            (object["controllerTemperatureValid"] as? NSNumber)?.boolValue
+                ?? (object["controllerTemperature"] != nil || object["batteryTemperature"] != nil)
         return ControllerState(
             id: normalizedSide,
             side: normalizedSide,
@@ -999,10 +1015,14 @@ class DaemonBridge: ObservableObject {
             macAddress: normalizedSide == "right" ? "Right BLE peripheral" : "Left BLE peripheral",
             isConnected: true,
             status: "streaming",
-            batteryVoltage: doubleValue(object["batteryVoltage"]),
-            batteryCurrent: doubleValue(object["batteryCurrent"]),
-            batteryTemperature: doubleValue(object["batteryTemperature"]),
+            batteryVoltage: batteryVoltage,
+            batteryCurrent: batteryCurrent,
+            controllerTemperature: controllerTemperature,
             batteryPercentage: doubleValue(object["batteryPercentage"], default: -1),
+            batteryChargeStatus: uint8Value(object["batteryChargeStatus"]),
+            batteryVoltageValid: batteryVoltageValid,
+            batteryCurrentValid: batteryCurrentValid,
+            controllerTemperatureValid: controllerTemperatureValid,
             buttons: uint32Value(object["buttons"]),
             leftButtons: uint32Value(object["leftButtons"]),
             rightButtons: uint32Value(object["rightButtons"]),
@@ -1150,7 +1170,10 @@ class DaemonBridge: ObservableObject {
                         macAddress: status.message.isEmpty ? status.name : status.message,
                         isConnected: status.isConnected,
                         status: status.status,
-                        batteryVoltage: 0, batteryCurrent: 0, batteryTemperature: 0, batteryPercentage: -1,
+                        batteryVoltage: 0, batteryCurrent: 0, controllerTemperature: 0,
+                        batteryPercentage: -1, batteryChargeStatus: 0,
+                        batteryVoltageValid: false, batteryCurrentValid: false,
+                        controllerTemperatureValid: false,
                         buttons: 0, leftButtons: 0, rightButtons: 0,
                         leftStickX: 0, leftStickY: 0, rightStickX: 0, rightStickY: 0,
                         gyroX: 0, gyroY: 0, gyroZ: 0,

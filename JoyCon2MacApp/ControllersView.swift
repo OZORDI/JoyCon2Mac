@@ -52,20 +52,36 @@ struct ControllersView: View {
 struct ControllerCard: View {
     let controller: ControllerState
 
+    private var hasBatteryReading: Bool {
+        controller.batteryPercentage >= 0 || controller.batteryVoltageValid
+    }
+
     private var batteryPercentage: Double {
         if controller.batteryPercentage >= 0 {
-            // Joy2Win uses the raw level at packet bytes 31/32, but on this
-            // hardware a charge-grip-full controller commonly reports about
-            // 89-90. Treat that top band as full instead of showing a false
-            // partial charge.
             if controller.batteryPercentage >= 88 {
                 return 100
             }
             return controller.batteryPercentage
         }
-        let minVoltage = 3.0
-        let maxVoltage = 4.2
-        let percentage = (controller.batteryVoltage - minVoltage) / (maxVoltage - minVoltage) * 100
+
+        guard controller.batteryVoltageValid else {
+            return 0
+        }
+
+        let emptyVoltage = 3.0
+        let nominalVoltage = 3.89
+        let fullVoltage = 4.45
+        let percentage: Double
+        if controller.batteryVoltage <= nominalVoltage {
+            percentage =
+                (controller.batteryVoltage - emptyVoltage)
+                / (nominalVoltage - emptyVoltage) * 50
+        } else {
+            percentage =
+                50
+                + (controller.batteryVoltage - nominalVoltage)
+                / (fullVoltage - nominalVoltage) * 50
+        }
         return max(0, min(100, percentage))
     }
 
@@ -129,16 +145,16 @@ struct ControllerCard: View {
             HStack(spacing: 16) {
                 MetricTile(
                     title: "Battery",
-                    value: controller.batteryPercentage >= 0 ? "\(Int(batteryPercentage))%" : "Unknown",
+                    value: hasBatteryReading ? "\(Int(batteryPercentage))%" : "Unknown",
                     detail: validBatteryVoltageText,
                     icon: batteryIcon,
-                    color: batteryColor
+                    color: hasBatteryReading ? batteryColor : .secondary
                 )
 
                 MetricTile(
                     title: "Temp",
-                    value: "\(Int(controller.batteryTemperature))°C",
-                    detail: "\(Int(controller.batteryCurrent))mA",
+                    value: controllerTemperatureText,
+                    detail: batteryCurrentText,
                     icon: "thermometer.medium",
                     color: .orange
                 )
@@ -181,10 +197,24 @@ struct ControllerCard: View {
     }
 
     private var validBatteryVoltageText: String {
-        guard controller.batteryVoltage >= 3.0, controller.batteryVoltage <= 5.5 else {
-            return batteryPercentage >= 100 ? "Full" : "No voltage"
+        guard controller.batteryVoltageValid else {
+            return "No voltage"
         }
         return String(format: "%.2fV", controller.batteryVoltage)
+    }
+
+    private var controllerTemperatureText: String {
+        guard controller.controllerTemperatureValid else {
+            return "Unavailable"
+        }
+        return String(format: "%.1f°C", controller.controllerTemperature)
+    }
+
+    private var batteryCurrentText: String {
+        guard controller.batteryCurrentValid else {
+            return "No current"
+        }
+        return String(format: "%.0fmA", controller.batteryCurrent)
     }
 }
 
