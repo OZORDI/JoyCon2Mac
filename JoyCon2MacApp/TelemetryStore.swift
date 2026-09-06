@@ -17,20 +17,20 @@ class TelemetryStore: ObservableObject {
     private var coalesceTimer: Timer?
     private let maxStoredLines = 600
     private let coalesceInterval: TimeInterval = 0.2
-    private(set) var logPath: URL?
-
     private init() {}
-
-    var telemetryLogPath: String {
-        logPath?.path ?? "~/Library/Application Support/JoyCon2Mac/daemon.jsonl"
-    }
-
-    func setLogPath(_ url: URL) {
-        logPath = url
-    }
 
     func append(_ line: String) {
         guard !line.isEmpty else { return }
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.appendOnMain(line)
+            }
+            return
+        }
+        appendOnMain(line)
+    }
+
+    private func appendOnMain(_ line: String) {
         pendingLines.append(line)
         if pendingLines.count > maxStoredLines * 2 {
             pendingLines.removeFirst(pendingLines.count - maxStoredLines)
@@ -57,11 +57,6 @@ class TelemetryStore: ObservableObject {
     func copyToClipboard() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(displayedOutput, forType: .string)
-    }
-
-    func revealLog() {
-        guard let logPath else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([logPath])
     }
 
     private func scheduleFlush() {

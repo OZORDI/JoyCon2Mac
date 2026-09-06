@@ -131,7 +131,7 @@ struct MainWindow: View {
     }
 
     private var connectedControllerCount: Int {
-        daemonBridge.controllers.filter { $0.isConnected }.count
+        daemonBridge.connectedControllerCount
     }
 
     @ViewBuilder
@@ -178,4 +178,5 @@ struct MainWindow: View {
 #Preview {
     MainWindow()
         .environmentObject(DaemonBridge.shared)
+        .environmentObject(DaemonBridge.shared.controllerStore)
 }

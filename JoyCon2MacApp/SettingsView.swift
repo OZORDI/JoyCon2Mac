@@ -81,21 +81,11 @@ struct SettingsView: View {
             }
 
             Section("Telemetry") {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Log File")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Text(daemonBridge.telemetryLogPath)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .lineLimit(2)
-                }
+                Text("Recent daemon events are kept in memory and capped; live controller state is not written to disk.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
 
                 HStack {
-                    Button("Reveal Log File") {
-                        daemonBridge.revealTelemetryLog()
-                    }
-
                     Button("Copy Visible Logs") {
                         daemonBridge.copyTelemetryToClipboard()
                     }
@@ -326,7 +316,6 @@ struct SettingsActionRow: View {
 }
 
 struct LogsView: View {
-    @EnvironmentObject var daemonBridge: DaemonBridge
     @ObservedObject private var telemetry = TelemetryStore.shared
 
     var body: some View {
@@ -335,20 +324,16 @@ struct LogsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("JoyCon2Mac Telemetry")
                         .font(.headline)
-                    Text(daemonBridge.telemetryLogPath)
-                        .font(.system(.caption, design: .monospaced))
+                    Text("Live, memory-only event history")
+                        .font(.caption)
                         .foregroundColor(.secondary)
-                        .textSelection(.enabled)
                 }
                 Spacer()
-                Button("Reveal") {
-                    daemonBridge.revealTelemetryLog()
-                }
                 Button("Copy") {
-                    daemonBridge.copyTelemetryToClipboard()
+                    telemetry.copyToClipboard()
                 }
                 Button("Clear") {
-                    daemonBridge.clearTelemetryView()
+                    telemetry.clear()
                 }
             }
             .padding(12)

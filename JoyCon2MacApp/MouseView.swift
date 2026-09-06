@@ -2,46 +2,63 @@ import SwiftUI
 
 struct MouseView: View {
     @EnvironmentObject var daemonBridge: DaemonBridge
+    @EnvironmentObject var controllerStore: ControllerStore
+    @AppStorage("mouse.gyroOutputMode") private var gyroOutputModeRaw = GyroOutputMode.mouse.rawValue
+    @AppStorage("mouse.gyroStickFullRate") private var gyroStickFullRate = 180.0
+    @AppStorage("mouse.gyroStickMinimumOutput") private var gyroStickMinimumOutput = 0.12
+    @AppStorage("mouse.gyroStickResponseCurve") private var gyroStickResponseCurve = 1.0
 
     private var leftController: ControllerState? {
-        daemonBridge.controllers.first(where: { $0.side == "left" })
+        controllerStore.controllers.first(where: { $0.side == "left" })
     }
     private var rightController: ControllerState? {
-        daemonBridge.controllers.first(where: { $0.side == "right" })
+        controllerStore.controllers.first(where: { $0.side == "right" })
     }
     // Source / mode live on the first controller. Any controller works —
     // the daemon is the authority, the `controllers[*].mouseSource` field
     // is just a mirror and both rows get updated together when the user
     // changes the picker.
     private var mouseMode: MouseMode {
-        daemonBridge.controllers.first?.mouseMode ?? .normal
+        controllerStore.controllers.first?.mouseMode ?? .normal
     }
     private var mouseSource: MouseSource {
-        daemonBridge.controllers.first?.mouseSource ?? .auto
+        controllerStore.controllers.first?.mouseSource ?? .auto
     }
     private var activeSide: String {
-        daemonBridge.controllers.first?.mouseActiveSide ?? "right"
+        controllerStore.controllers.first?.mouseActiveSide ?? "right"
     }
     private var pointerMethod: PointerMethod {
-        daemonBridge.controllers.first?.pointerMethod ?? .optical
+        controllerStore.controllers.first?.pointerMethod ?? .optical
     }
     private var gyroSource: GyroMouseSource {
-        daemonBridge.controllers.first?.gyroMouseSource ?? .fused
+        controllerStore.controllers.first?.gyroMouseSource ?? .fused
+    }
+    private var gyroOutputMode: GyroOutputMode {
+        GyroOutputMode(rawValue: gyroOutputModeRaw) ?? .mouse
     }
     private var gyroEnabled: Bool {
-        daemonBridge.controllers.first?.gyroAimingEnabled ?? false
+        controllerStore.controllers.first?.gyroAimingEnabled ?? false
+    }
+    private var gyroOutputActive: Bool {
+        controllerStore.controllers.first?.gyroOutputActive ?? false
     }
     private var gyroCalibrating: Bool {
-        daemonBridge.controllers.first?.gyroCalibrating ?? true
+        controllerStore.controllers.first?.gyroCalibrating ?? true
     }
     private var gyroActiveSource: String {
-        daemonBridge.controllers.first?.gyroActiveSource ?? "none"
+        controllerStore.controllers.first?.gyroActiveSource ?? "none"
     }
-    private var leftToggleBinding: GyroToggleBinding {
-        daemonBridge.controllers.first?.leftGyroToggleBinding ?? .capture
+    private var gyroActivationMode: GyroActivationMode {
+        controllerStore.controllers.first?.gyroActivationMode ?? .hold
     }
-    private var rightToggleBinding: GyroToggleBinding {
-        daemonBridge.controllers.first?.rightGyroToggleBinding ?? .chat
+    private var gyroActivationSlot1: GyroActivationBinding {
+        controllerStore.controllers.first?.gyroActivationSlot1 ?? .zl
+    }
+    private var gyroActivationSlot2: GyroActivationBinding {
+        controllerStore.controllers.first?.gyroActivationSlot2 ?? .none
+    }
+    private var gyroActivationSlot3: GyroActivationBinding {
+        controllerStore.controllers.first?.gyroActivationSlot3 ?? .none
     }
 
     var body: some View {
@@ -52,8 +69,10 @@ struct MouseView: View {
                 Divider()
                 pointerMethodPicker
 
-                Divider()
-                modePicker
+                if pointerMethod == .optical || gyroOutputMode == .mouse {
+                    Divider()
+                    modePicker
+                }
 
                 Divider()
                 if pointerMethod == .optical {
@@ -150,7 +169,7 @@ struct MouseView: View {
                 Spacer()
                 Label(gyroStatusText, systemImage: gyroStatusIcon)
                     .font(.caption)
-                    .foregroundColor(gyroEnabled ? .green : .secondary)
+                    .foregroundColor(gyroOutputActive ? .green : (gyroEnabled ? .orange : .secondary))
             }
 
             Picker("Gyro Source", selection: Binding<GyroMouseSource>(
@@ -162,6 +181,26 @@ struct MouseView: View {
                 Text("Right Joy-Con").tag(GyroMouseSource.right)
             }
             .pickerStyle(.segmented)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Output")
+                    .font(.subheadline.weight(.semibold))
+                Picker("Output", selection: Binding<GyroOutputMode>(
+                    get: { gyroOutputMode },
+                    set: {
+                        gyroOutputModeRaw = $0.rawValue
+                        daemonBridge.setGyroOutputMode($0)
+                    }
+                )) {
+                    Text("Mouse Cursor").tag(GyroOutputMode.mouse)
+                    Text("Right Stick").tag(GyroOutputMode.rightStick)
+                }
+                .pickerStyle(.segmented)
+            }
+
+            if gyroOutputMode == .rightStick {
+                gyroStickControls
+            }
 
             HStack(spacing: 12) {
                 Button {
@@ -180,48 +219,164 @@ struct MouseView: View {
                 .buttonStyle(.bordered)
             }
 
-            Text("Hold the selected Joy-Con still while calibrating. Rotation moves the pointer; stopping rotation stops it.")
+            Text(gyroOutputMode == .mouse
+                 ? "Hold the selected Joy-Con still while calibrating. Rotation moves the pointer; stopping rotation stops it."
+                 : "Gyro aiming is added to the physical right stick. Releasing both inputs returns the stick to center.")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
             VStack(alignment: .leading, spacing: 10) {
-                Text("Activation Buttons")
+                Text("Activation")
                     .font(.subheadline.weight(.semibold))
-                HStack(spacing: 18) {
-                    Picker("Left", selection: Binding<GyroToggleBinding>(
-                        get: { leftToggleBinding },
-                        set: { daemonBridge.setGyroToggleBindings(left: $0, right: rightToggleBinding) }
-                    )) {
-                        ForEach(GyroToggleBinding.leftChoices) { binding in
-                            Text(binding.label).tag(binding)
-                        }
-                    }
-                    Picker("Right", selection: Binding<GyroToggleBinding>(
-                        get: { rightToggleBinding },
-                        set: { daemonBridge.setGyroToggleBindings(left: leftToggleBinding, right: $0) }
-                    )) {
-                        ForEach(GyroToggleBinding.rightChoices) { binding in
-                            Text(binding.label).tag(binding)
-                        }
+                Picker("Activation", selection: Binding<GyroActivationMode>(
+                    get: { gyroActivationMode },
+                    set: { applyGyroActivation(mode: $0) }
+                )) {
+                    ForEach(GyroActivationMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
                     }
                 }
+                .pickerStyle(.segmented)
 
-                Text("Quickly double-press either selected button to start or stop Gyro Aiming.")
+                if gyroActivationMode != .continuous {
+                    activationBindingPicker("Primary", selection: Binding(
+                        get: { gyroActivationSlot1 },
+                        set: { applyGyroActivation(slot1: $0) }
+                    ))
+                    activationBindingPicker("Secondary", selection: Binding(
+                        get: { gyroActivationSlot2 },
+                        set: { applyGyroActivation(slot2: $0) }
+                    ))
+                    activationBindingPicker("Tertiary", selection: Binding(
+                        get: { gyroActivationSlot3 },
+                        set: { applyGyroActivation(slot3: $0) }
+                    ))
+                }
+
+                Text(gyroActivationHelpText)
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
         }
     }
 
+    private var gyroStickControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Full Stick Rate")
+                Spacer()
+                Text("\(Int(gyroStickFullRate)) deg/s")
+                    .foregroundColor(.secondary)
+                    .monospacedDigit()
+            }
+            Slider(value: Binding(
+                get: { gyroStickFullRate },
+                set: {
+                    gyroStickFullRate = $0
+                    applyGyroStickSettings()
+                }
+            ), in: 30...720, step: 10)
+
+            HStack {
+                Text("Minimum Output")
+                Spacer()
+                Text(gyroStickMinimumOutput.formatted(.number.precision(.fractionLength(2))))
+                    .foregroundColor(.secondary)
+                    .monospacedDigit()
+            }
+            Slider(value: Binding(
+                get: { gyroStickMinimumOutput },
+                set: {
+                    gyroStickMinimumOutput = $0
+                    applyGyroStickSettings()
+                }
+            ), in: 0...0.5, step: 0.01)
+
+            HStack {
+                Text("Response Curve")
+                Spacer()
+                Text(gyroStickResponseCurve.formatted(.number.precision(.fractionLength(2))))
+                    .foregroundColor(.secondary)
+                    .monospacedDigit()
+            }
+            Slider(value: Binding(
+                get: { gyroStickResponseCurve },
+                set: {
+                    gyroStickResponseCurve = $0
+                    applyGyroStickSettings()
+                }
+            ), in: 0.25...4, step: 0.05)
+        }
+    }
+
+    private func activationBindingPicker(_ title: String,
+                                         selection: Binding<GyroActivationBinding>) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Picker(title, selection: selection) {
+                ForEach(GyroActivationBinding.allCases) { binding in
+                    Text(binding.label).tag(binding)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 190)
+        }
+    }
+
+    private func applyGyroActivation(mode: GyroActivationMode? = nil,
+                                     slot1: GyroActivationBinding? = nil,
+                                     slot2: GyroActivationBinding? = nil,
+                                     slot3: GyroActivationBinding? = nil) {
+        daemonBridge.setGyroActivation(
+            mode: mode ?? gyroActivationMode,
+            slot1: slot1 ?? gyroActivationSlot1,
+            slot2: slot2 ?? gyroActivationSlot2,
+            slot3: slot3 ?? gyroActivationSlot3
+        )
+    }
+
+    private var gyroActivationButtonSummary: String {
+        let labels = [gyroActivationSlot1, gyroActivationSlot2, gyroActivationSlot3]
+            .filter { $0 != .none }
+            .map(\.label)
+        return labels.isEmpty ? "a configured button" : labels.joined(separator: " or ")
+    }
+
+    private var gyroActivationHelpText: String {
+        switch gyroActivationMode {
+        case .continuous:
+            return "Gyro output remains active whenever Gyro Aiming is started."
+        case .hold:
+            return "Hold \(gyroActivationButtonSummary) to activate gyro output. The buttons still pass through to games."
+        case .toggle:
+            return "Press \(gyroActivationButtonSummary) to toggle gyro output. The buttons still pass through to games."
+        }
+    }
+
+    private func applyGyroStickSettings() {
+        daemonBridge.setGyroStickSettings(
+            fullRate: gyroStickFullRate,
+            minimumOutput: gyroStickMinimumOutput,
+            responseCurve: gyroStickResponseCurve
+        )
+    }
+
     private var gyroStatusText: String {
         if gyroCalibrating { return "Calibrating" }
-        if gyroEnabled { return "Active: \(gyroActiveSource.capitalized)" }
-        return "Ready"
+        if !gyroEnabled { return "Stopped" }
+        if gyroOutputActive { return "Active: \(gyroActiveSource.capitalized)" }
+        switch gyroActivationMode {
+        case .continuous: return "Starting"
+        case .hold: return "Waiting for Hold"
+        case .toggle: return "Ready to Toggle"
+        }
     }
 
     private var gyroStatusIcon: String {
         if gyroCalibrating { return "circle.dotted" }
-        return gyroEnabled ? "scope" : "pause.circle"
+        if gyroOutputActive { return "scope" }
+        return gyroEnabled ? "hand.raised.fill" : "pause.circle"
     }
 
     private var sourcePicker: some View {
@@ -388,5 +543,6 @@ struct MouseView: View {
 #Preview {
     MouseView()
         .environmentObject(DaemonBridge.shared)
+        .environmentObject(DaemonBridge.shared.controllerStore)
         .frame(width: 800, height: 600)
 }

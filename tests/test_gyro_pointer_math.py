@@ -1,5 +1,6 @@
 import math
 import unittest
+from pathlib import Path
 
 
 NOMINAL_PACKET_RATE = 200.0 / 3.0
@@ -16,7 +17,6 @@ CONTROL_ARROW_USAGES = {
 }
 GYRO_REARM_SECONDS = 0.15
 SURFACE_CONFIRM_FRAMES = 3
-DOUBLE_TAP_SECONDS = 0.35
 SCROLL_DEADZONE = 4000
 MAX_SCROLL_CLICKS_PER_SECOND = 40.0 * (200.0 / 3.0) / 120.0
 
@@ -71,6 +71,36 @@ def integrate_rate(rate_degrees_per_second, seconds, scale):
 
 def gyro_pointer_delta(pitch_rate, yaw_rate, seconds, scale):
     return yaw_rate * seconds * scale, -pitch_rate * seconds * scale
+
+
+def gyro_right_stick(pitch_rate, yaw_rate, activation_rate,
+                     full_rate, minimum_output, response_curve):
+    x = yaw_rate
+    y = -pitch_rate
+    magnitude = math.hypot(x, y)
+    if magnitude <= activation_rate:
+        return 0.0, 0.0
+    normalized = max(
+        0.0,
+        min(1.0, (magnitude - activation_rate) / (full_rate - activation_rate)),
+    )
+    output_magnitude = minimum_output + (
+        1.0 - minimum_output
+    ) * normalized ** response_curve
+    return (
+        x / magnitude * output_magnitude,
+        y / magnitude * output_magnitude,
+    )
+
+
+def blend_right_stick(physical, gyro):
+    x = physical[0] + gyro[0]
+    y = physical[1] + gyro[1]
+    magnitude = math.hypot(x, y)
+    if magnitude > 1.0:
+        x /= magnitude
+        y /= magnitude
+    return x, y
 
 
 def normalize(vector):
@@ -150,16 +180,34 @@ def clamp_cursor(position, delta, bounds):
     )
 
 
-def double_tap_edges(edge_times):
-    last_tap = None
-    toggles = 0
-    for timestamp in edge_times:
-        if last_tap is not None and timestamp - last_tap <= DOUBLE_TAP_SECONDS:
-            toggles += 1
-            last_tap = None
-        else:
-            last_tap = timestamp
-    return toggles
+class GyroActivationModel:
+    def __init__(self, mode="hold", slots=("zl", "none", "none")):
+        self.mode = mode
+        self.slots = slots
+        self.master_enabled = False
+        self.toggle_latched = False
+        self.previously_pressed = set()
+
+    def set_master_enabled(self, enabled):
+        self.master_enabled = enabled
+        if not enabled:
+            self.toggle_latched = False
+
+    def update(self, pressed_buttons):
+        configured = {slot for slot in self.slots if slot != "none"}
+        pressed = set(pressed_buttons) & configured
+        rising = pressed - self.previously_pressed
+        self.previously_pressed = pressed
+        if self.mode == "toggle" and self.master_enabled and rising:
+            self.toggle_latched = not self.toggle_latched
+
+        if not self.master_enabled:
+            return False
+        if self.mode == "continuous":
+            return True
+        if self.mode == "hold":
+            return bool(pressed)
+        return self.toggle_latched
 
 
 def integrate_gyro_scroll(stick_y, seconds):
@@ -348,6 +396,43 @@ class GyroPointerMathTests(unittest.TestCase):
         dx, _ = gyro_pointer_delta(0.0, 20.0, 0.1, 1.0)
         self.assertGreater(dx, 0.0)
 
+    def test_rightward_yaw_moves_virtual_stick_right(self):
+        x, y = gyro_right_stick(0.0, 20.0, 0.75, 180.0, 0.12, 1.0)
+        self.assertGreater(x, 0.0)
+        self.assertEqual(y, 0.0)
+
+    def test_upward_pitch_moves_virtual_stick_up(self):
+        x, y = gyro_right_stick(20.0, 0.0, 0.75, 180.0, 0.12, 1.0)
+        self.assertEqual(x, 0.0)
+        self.assertLess(y, 0.0)
+
+    def test_virtual_stick_centers_below_activation_rate(self):
+        self.assertEqual(
+            gyro_right_stick(0.0, 0.5, 0.75, 180.0, 0.12, 1.0),
+            (0.0, 0.0),
+        )
+
+    def test_virtual_stick_reaches_full_scale(self):
+        output = gyro_right_stick(0.0, 180.0, 0.75, 180.0, 0.12, 1.0)
+        self.assertAlmostEqual(math.hypot(*output), 1.0)
+
+    def test_virtual_stick_minimum_output_clears_game_deadzone(self):
+        output = gyro_right_stick(0.0, 0.76, 0.75, 180.0, 0.12, 1.0)
+        self.assertGreaterEqual(math.hypot(*output), 0.12)
+
+    def test_physical_and_gyro_sticks_blend_additively(self):
+        output = blend_right_stick((0.4, 0.0), (0.2, 0.0))
+        self.assertAlmostEqual(output[0], 0.6)
+        self.assertEqual(output[1], 0.0)
+
+    def test_blended_stick_is_radially_clamped(self):
+        output = blend_right_stick((0.9, 0.7), (0.5, 0.4))
+        self.assertAlmostEqual(math.hypot(*output), 1.0)
+
+    def test_opposing_gyro_reduces_physical_stick(self):
+        output = blend_right_stick((0.6, 0.0), (-0.2, 0.0))
+        self.assertLess(output[0], 0.6)
+
     def test_leftward_yaw_moves_pointer_left(self):
         dx, _ = gyro_pointer_delta(0.0, -20.0, 0.1, 1.0)
         self.assertLess(dx, 0.0)
@@ -488,15 +573,62 @@ class GyroPointerMathTests(unittest.TestCase):
         self.assertTrue(now - (now - FRESHNESS_SECONDS + 0.0001) <= FRESHNESS_SECONDS)
         self.assertFalse(now - (now - FRESHNESS_SECONDS - 0.001) <= FRESHNESS_SECONDS)
 
-    def test_single_toggle_press_does_nothing(self):
-        self.assertEqual(double_tap_edges([10.0]), 0)
+    def test_continuous_activation_ignores_button_state(self):
+        activation = GyroActivationModel(mode="continuous")
+        activation.set_master_enabled(True)
+        self.assertTrue(activation.update(set()))
 
-    def test_rapid_double_tap_toggles_once(self):
-        self.assertEqual(double_tap_edges([10.0, 10.30]), 1)
+    def test_hold_activation_defaults_to_zl(self):
+        activation = GyroActivationModel()
+        activation.set_master_enabled(True)
+        self.assertFalse(activation.update(set()))
+        self.assertTrue(activation.update({"zl"}))
+        self.assertFalse(activation.update(set()))
 
-    def test_slow_second_press_starts_a_new_pair(self):
-        self.assertEqual(double_tap_edges([10.0, 10.36]), 0)
-        self.assertEqual(double_tap_edges([10.0, 10.36, 10.60]), 1)
+    def test_hold_activation_uses_or_semantics(self):
+        activation = GyroActivationModel(slots=("zl", "zr", "a"))
+        activation.set_master_enabled(True)
+        self.assertTrue(activation.update({"zl", "a"}))
+        self.assertTrue(activation.update({"a"}))
+        self.assertFalse(activation.update(set()))
+
+    def test_toggle_activation_fires_once_per_rising_edge(self):
+        activation = GyroActivationModel(mode="toggle")
+        activation.set_master_enabled(True)
+        self.assertTrue(activation.update({"zl"}))
+        self.assertTrue(activation.update({"zl"}))
+        self.assertTrue(activation.update(set()))
+        self.assertFalse(activation.update({"zl"}))
+
+    def test_toggle_duplicate_slots_only_toggle_once(self):
+        activation = GyroActivationModel(mode="toggle", slots=("zl", "zl", "zl"))
+        activation.set_master_enabled(True)
+        self.assertTrue(activation.update({"zl"}))
+
+    def test_toggle_simultaneous_buttons_only_toggle_once(self):
+        activation = GyroActivationModel(mode="toggle", slots=("zl", "zr", "a"))
+        activation.set_master_enabled(True)
+        self.assertTrue(activation.update({"zl", "zr", "a"}))
+
+    def test_toggle_can_change_while_another_activation_button_is_held(self):
+        activation = GyroActivationModel(mode="toggle", slots=("zl", "zr", "none"))
+        activation.set_master_enabled(True)
+        self.assertTrue(activation.update({"zl"}))
+        self.assertFalse(activation.update({"zl", "zr"}))
+
+    def test_disabling_master_clears_toggle_latch(self):
+        activation = GyroActivationModel(mode="toggle")
+        activation.set_master_enabled(True)
+        self.assertTrue(activation.update({"zl"}))
+        activation.set_master_enabled(False)
+        self.assertFalse(activation.update(set()))
+        activation.set_master_enabled(True)
+        self.assertFalse(activation.update(set()))
+
+    def test_activation_buttons_are_not_removed_from_gamepad_reports(self):
+        source = (Path(__file__).parents[1] / "JoyCon2Mac" / "main.mm").read_text()
+        self.assertNotIn("g_gyroConsumed", source)
+        self.assertNotIn("gyroConsumedMask", source)
 
     def test_gyro_stick_scroll_matches_optical_direction_and_rate(self):
         self.assertEqual(integrate_gyro_scroll(32767, 1.0), 22)

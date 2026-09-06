@@ -2,6 +2,7 @@ import SwiftUI
 
 struct GamepadView: View {
     @EnvironmentObject var daemonBridge: DaemonBridge
+    @EnvironmentObject var controllerStore: ControllerStore
     @AppStorage("railBinding.leftSL") private var leftSLBinding = RailBindingTarget.none.rawValue
     @AppStorage("railBinding.leftSR") private var leftSRBinding = RailBindingTarget.none.rawValue
     @AppStorage("railBinding.rightSL") private var rightSLBinding = RailBindingTarget.none.rawValue
@@ -10,15 +11,15 @@ struct GamepadView: View {
     @State private var captureNeedsRelease = false
 
     private var leftController: ControllerState? {
-        daemonBridge.controllers.first { $0.side == "left" }
+        controllerStore.controllers.first { $0.side == "left" }
     }
 
     private var rightController: ControllerState? {
-        daemonBridge.controllers.first { $0.side == "right" }
+        controllerStore.controllers.first { $0.side == "right" }
     }
 
     private var primaryController: ControllerState? {
-        leftController ?? rightController ?? daemonBridge.controllers.first
+        leftController ?? rightController ?? controllerStore.controllers.first
     }
 
     private var leftButtons: UInt32 {
@@ -601,5 +602,6 @@ struct ButtonIndicator: View {
 #Preview {
     GamepadView()
         .environmentObject(DaemonBridge.shared)
+        .environmentObject(DaemonBridge.shared.controllerStore)
         .frame(width: 800, height: 600)
 }

@@ -42,12 +42,26 @@ struct ControllerState: Identifiable {
     var mouseActiveSide: String
     var pointerMethod: PointerMethod
     var gyroMouseSource: GyroMouseSource
+    var gyroOutputMode: GyroOutputMode
+    var gyroStickFullRate: Double
+    var gyroStickMinimumOutput: Double
+    var gyroStickResponseCurve: Double
     var gyroAimingEnabled: Bool
+    var gyroOutputActive: Bool
     var gyroCalibrating: Bool
     var gyroActiveSource: String
-    var leftGyroToggleBinding: GyroToggleBinding
-    var rightGyroToggleBinding: GyroToggleBinding
+    var gyroActivationMode: GyroActivationMode
+    var gyroActivationSlot1: GyroActivationBinding
+    var gyroActivationSlot2: GyroActivationBinding
+    var gyroActivationSlot3: GyroActivationBinding
     var rssi: Int
+}
+
+/// High-rate controller snapshots live outside `DaemonBridge` so publishing a
+/// stick or IMU sample does not invalidate every view that observes daemon
+/// lifecycle, settings, or NFC state.
+final class ControllerStore: ObservableObject {
+    @Published fileprivate(set) var controllers: [ControllerState] = []
 }
 
 enum MouseMode: Int {
@@ -106,26 +120,63 @@ enum GyroMouseSource: Int {
     case right = 2
 }
 
-enum GyroToggleBinding: String, CaseIterable, Identifiable {
-    case capture, chat, minus, plus, home, sl, sr, stick
+enum GyroOutputMode: Int {
+    case mouse = 0
+    case rightStick = 1
+}
+
+enum GyroActivationMode: Int, CaseIterable, Identifiable {
+    case continuous = 0
+    case hold = 1
+    case toggle = 2
+
+    var id: Int { rawValue }
+
+    var label: String {
+        switch self {
+        case .continuous: return "Continuous"
+        case .hold: return "Hold"
+        case .toggle: return "Toggle"
+        }
+    }
+}
+
+enum GyroActivationBinding: String, CaseIterable, Identifiable {
+    case none
+    case dpadUp, dpadDown, dpadLeft, dpadRight
+    case l, zl, minus, leftStick, capture, leftSL, leftSR
+    case a, b, x, y, r, zr, plus, rightStick, home, chat, rightSL, rightSR
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
+        case .none: return "None"
+        case .dpadUp: return "D-Pad Up"
+        case .dpadDown: return "D-Pad Down"
+        case .dpadLeft: return "D-Pad Left"
+        case .dpadRight: return "D-Pad Right"
+        case .l: return "L / L1"
+        case .zl: return "ZL / L2"
         case .capture: return "Capture"
-        case .chat: return "Chat"
         case .minus: return "Minus"
+        case .leftStick: return "Left Stick / L3"
+        case .leftSL: return "Left SL"
+        case .leftSR: return "Left SR"
+        case .a: return "A"
+        case .b: return "B"
+        case .x: return "X"
+        case .y: return "Y"
+        case .r: return "R / R1"
+        case .zr: return "ZR / R2"
         case .plus: return "Plus"
+        case .rightStick: return "Right Stick / R3"
         case .home: return "Home"
-        case .sl: return "SL"
-        case .sr: return "SR"
-        case .stick: return "Stick Click"
+        case .chat: return "Chat"
+        case .rightSL: return "Right SL"
+        case .rightSR: return "Right SR"
         }
     }
-
-    static let leftChoices: [GyroToggleBinding] = [.capture, .minus, .sl, .sr, .stick]
-    static let rightChoices: [GyroToggleBinding] = [.chat, .home, .plus, .sl, .sr, .stick]
 }
 
 struct NFCDecodedRecord: Identifiable, Equatable {
@@ -366,11 +417,9 @@ enum NFCDecoder {
 
 // Design notes (frozen-UI postmortem)
 //
-// The UI was freezing because the main thread was doing:
-//   1. File I/O (tailing daemon.jsonl every 100 ms)
-//   2. JSON parsing for ~240 state events per second
-//   3. Appending to a Published string (invalidating every view)
-//   4. SwiftUI view updates
+// The UI was freezing because an append-only JSONL file was polled every 8 ms
+// while controller snapshots were published at up to 120 Hz. Every view that
+// observed DaemonBridge was consequently invalidated by controller motion.
 //
 // Throttling step 3 in isolation does NOT help: steps 1-2 still thrash the
 // main run loop. SwiftUI cannot repaint. Apple's Combine / Concurrency docs
@@ -378,27 +427,36 @@ enum NFCDecoder {
 // explicitly recommend running data ingest on a background queue and
 // publishing to main via a throttled pipeline.
 //
-// So the real fix is architectural:
-//   - Log tailing + JSON parsing run on a dedicated serial background queue.
-//   - State events are gated at display-rate cadence on that queue. The old
-//     15 Hz gate was safe but visibly laggy for button/stick tester UI.
-//   - Only the gated, pre-built ControllerState is hopped onto main.
-//   - Telemetry log lines go to TelemetryStore, which batch-flushes to main
-//     every 200 ms. Settings/Logs views are the only subscribers.
+// The transport is now a named pipe: FileHandle wakes only when bytes arrive,
+// and consumed state never accumulates on disk. JSON parsing remains on a
+// serial background queue, state is coalesced at 30 Hz, and high-rate
+// ControllerState publication is isolated in ControllerStore. Telemetry text
+// remains isolated in TelemetryStore.
 class DaemonBridge: ObservableObject {
     static let shared = DaemonBridge()
 
-    @Published var controllers: [ControllerState] = []
+    let controllerStore = ControllerStore()
+    var controllers: [ControllerState] {
+        get { controllerStore.controllers }
+        set {
+            controllerStore.controllers = newValue
+            let count = newValue.lazy.filter(\.isConnected).count
+            if connectedControllerCount != count {
+                connectedControllerCount = count
+            }
+        }
+    }
+
+    @Published private(set) var connectedControllerCount = 0
     @Published var nfcTags: [NFCTag] = []
     @Published var isDaemonRunning = false
     // Kept for source-compat with older views. Never mutated from the
     // packet firehose now; only on driver-install result.
     @Published var driverInstallStatus: String = ""
-    @Published var stateRevision: UInt64 = 0
     @Published var findingLeftJoyCon = false
     @Published var findingRightJoyCon = false
 
-    // Background queue that owns parsing, file tailing, and throttling.
+    // Background queue that owns stream parsing and throttling.
     // Nothing on this queue touches @Published state directly.
     private let ingestQueue = DispatchQueue(label: "local.joycon2mac.ingest", qos: .userInitiated)
 
@@ -408,12 +466,10 @@ class DaemonBridge: ObservableObject {
     private var pendingOutput = ""
     // Per-controller rate limiter (accessed only on ingestQueue).
     private var lastIngestTime: [String: Date] = [:]
-    private let controllerUpdateInterval: TimeInterval = 1.0 / 120.0
+    private let controllerUpdateInterval: TimeInterval = 1.0 / 30.0
     private var shouldRestartAfterTermination = false
-    private var logPollTimer: DispatchSourceTimer?
-    private let logPollInterval: DispatchTimeInterval = .milliseconds(8)
-    private var daemonLogPath: URL?
-    private var daemonLogOffset: UInt64 = 0
+    private var daemonStreamHandle: FileHandle?
+    private var daemonStreamPath: URL?
     // Path the daemon polls for GUI → daemon commands (mouse-mode toggle etc).
     // Stored as URL so we can append with NSFileHandle without re-resolving
     // the Application Support directory each time.
@@ -569,7 +625,7 @@ class DaemonBridge: ObservableObject {
                 self.daemonProcess = nil
                 self.daemonApplication = nil
                 self.outputPipe = nil
-                self.stopLogPolling()
+                self.stopDaemonStream()
                 self.isDaemonRunning = false
                 if shouldRestart {
                     self.startDaemon()
@@ -623,25 +679,26 @@ class DaemonBridge: ObservableObject {
                 create: true
             ).appendingPathComponent("JoyCon2Mac", isDirectory: true)
             try FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
-            let logPath = supportDir.appendingPathComponent("daemon.jsonl")
-            try Data().write(to: logPath, options: .atomic)
-            daemonLogPath = logPath
-            daemonLogOffset = 0
+            // State is a live IPC stream, not a durable log. Replacing the old
+            // append-only daemon.jsonl with a FIFO prevents controller frames
+            // from accumulating gigabytes on disk and lets FileHandle wake us
+            // only when the daemon has data.
+            let streamPath = supportDir.appendingPathComponent("daemon.jsonl")
+            try prepareDaemonStream(at: streamPath)
             // Control-channel file. GUI writes one JSON command per line,
             // daemon polls. Truncate on start so stale commands from a
             // previous session don't get re-applied.
             let controlPath = supportDir.appendingPathComponent("control.jsonl")
             try Data().write(to: controlPath, options: .atomic)
             daemonControlPath = controlPath
-            TelemetryStore.shared.setLogPath(logPath)
-            // Open (shared-append) the same input-trace.log the daemon is
-            // going to write [BLE->DEC] and [HID-TX] lines into. Our side
-            // appends [UI R] / [UI L] lines on JSON ingest so a single
-            // `tail -f` on this one file shows all three pipeline stages.
-            let tracePath = supportDir.appendingPathComponent("input-trace.log")
-            // Truncate so each session's trace starts clean.
-            try? Data().write(to: tracePath, options: .atomic)
-            openTraceFile(at: tracePath)
+            // Detailed input tracing is intentionally opt-in. Stick and IMU
+            // noise make change-triggered traces surprisingly write-heavy.
+            let inputTraceEnabled = UserDefaults.standard.bool(forKey: "diagnostics.inputTrace")
+            if inputTraceEnabled {
+                let tracePath = supportDir.appendingPathComponent("input-trace.log")
+                try? Data().write(to: tracePath, options: .atomic)
+                openTraceFile(at: tracePath)
+            }
             controllers.removeAll()
             ingestQueue.async { [weak self] in
                 self?.lastIngestTime.removeAll()
@@ -654,22 +711,20 @@ class DaemonBridge: ObservableObject {
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.activates = false
             configuration.createsNewApplicationInstance = true
-            // The daemon's change-triggered input trace is on by default and
-            // mirrors to ~/Library/Application Support/JoyCon2Mac/input-trace.log
-            // so you can just `tail -f` that file while playing. To turn it
-            // off: edit the daemon args below and add "--no-debug-input".
             var arguments = [
                 "--json",
-                "--json-file", logPath.path,
+                "--json-file", streamPath.path,
                 "--control-file", controlPath.path
             ]
+            if inputTraceEnabled {
+                arguments.append("--debug-input")
+            }
             if UserDefaults.standard.bool(forKey: "sdlOnlyMode") {
                 arguments.append("--sdl-only")
             }
             configuration.arguments = arguments
 
             isDaemonRunning = true
-            startLogPolling()
 
             NSWorkspace.shared.openApplication(at: helperApp, configuration: configuration) { [weak self] app, error in
                 DispatchQueue.main.async {
@@ -678,14 +733,13 @@ class DaemonBridge: ObservableObject {
                     if let error {
                         TelemetryStore.shared.append("Failed to start helper daemon: \(error)")
                         self.isDaemonRunning = false
-                        self.stopLogPolling()
+                        self.stopDaemonStream()
                         self.markControllersDisconnected(status: "daemonStopped")
                         return
                     }
                     self.daemonApplication = app
-                    // Observe termination so we can flip the running flag
-                    // if the helper dies unexpectedly. pollDaemonLog also
-                    // catches this but the observer reacts faster.
+                    // Observe termination so we can flip the running flag if
+                    // the helper dies unexpectedly.
                     if let app {
                         self.observeDaemonTermination(app: app, generation: generation)
                     }
@@ -693,7 +747,8 @@ class DaemonBridge: ObservableObject {
             }
             return true
         } catch {
-            TelemetryStore.shared.append("Failed to prepare daemon log: \(error)")
+            stopDaemonStream()
+            TelemetryStore.shared.append("Failed to prepare daemon stream: \(error)")
             return false
         }
     }
@@ -726,14 +781,14 @@ class DaemonBridge: ObservableObject {
                 }
             }
             self.daemonApplication = nil
-            stopLogPolling()
+            stopDaemonStream()
             markControllersDisconnected(status: "daemonStopped")
             return
         }
 
         guard let process = daemonProcess else {
             outputPipe = nil
-            stopLogPolling()
+            stopDaemonStream()
             markControllersDisconnected(status: "daemonStopped")
             return
         }
@@ -766,53 +821,73 @@ class DaemonBridge: ObservableObject {
         }
     }
 
-    // MARK: - Log tailing (background)
+    // MARK: - Daemon event stream
 
-    private func startLogPolling() {
-        stopLogPolling()
-        let timer = DispatchSource.makeTimerSource(queue: ingestQueue)
-        timer.schedule(deadline: .now() + logPollInterval, repeating: logPollInterval, leeway: .milliseconds(1))
-        timer.setEventHandler { [weak self] in
-            self?.pollDaemonLogOnIngestQueue()
-        }
-        logPollTimer = timer
-        timer.resume()
-    }
+    private func prepareDaemonStream(at path: URL) throws {
+        stopDaemonStream()
 
-    private func stopLogPolling() {
-        logPollTimer?.cancel()
-        logPollTimer = nil
-    }
-
-    private func pollDaemonLogOnIngestQueue() {
-        // Runs on ingestQueue.
-        if let daemonApplication, daemonApplication.isTerminated {
-            DispatchQueue.main.async { [weak self] in self?.handleDaemonTerminated() }
-            return
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: path.path) {
+            try fileManager.removeItem(at: path)
         }
 
-        guard let daemonLogPath else { return }
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: daemonLogPath.path),
-              let fileSize = attributes[.size] as? UInt64 else {
-            return
+        guard Darwin.mkfifo(path.path, mode_t(0o600)) == 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Could not create daemon event pipe"]
+            )
         }
-        if fileSize < daemonLogOffset {
-            daemonLogOffset = 0
+
+        // O_RDWR keeps the FIFO alive before LaunchServices starts the helper
+        // and prevents a transient EOF between daemon restarts. O_NONBLOCK
+        // guarantees setup cannot wait on a process that has not launched yet.
+        let descriptor = Darwin.open(path.path, O_RDWR | O_NONBLOCK)
+        guard descriptor >= 0 else {
+            let openError = errno
+            try? fileManager.removeItem(at: path)
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(openError),
+                userInfo: [NSLocalizedDescriptionKey: "Could not open daemon event pipe"]
+            )
         }
-        guard fileSize > daemonLogOffset,
-              let handle = try? FileHandle(forReadingFrom: daemonLogPath) else {
-            return
-        }
-        do {
-            try handle.seek(toOffset: daemonLogOffset)
-            let data = handle.readDataToEndOfFile()
-            daemonLogOffset = try handle.offset()
-            try handle.close()
-            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
-                parseDaemonOutputOnIngestQueue(output)
+
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        daemonStreamPath = path
+        daemonStreamHandle = handle
+        handle.readabilityHandler = { [weak self] readableHandle in
+            let data = readableHandle.availableData
+            guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else {
+                return
             }
-        } catch {
-            try? handle.close()
+            self?.ingestQueue.async { [weak self] in
+                self?.parseDaemonOutputOnIngestQueue(output)
+            }
+        }
+    }
+
+    private func stopDaemonStream() {
+        let handle = daemonStreamHandle
+        daemonStreamHandle = nil
+        handle?.readabilityHandler = nil
+        try? handle?.close()
+
+        let traceHandle = traceFileHandle
+        traceFileHandle = nil
+        try? traceHandle?.close()
+        lastTraceRightX = .min
+        lastTraceRightY = .min
+        lastTraceLeftX = .min
+        lastTraceLeftY = .min
+
+        if let path = daemonStreamPath {
+            try? FileManager.default.removeItem(at: path)
+        }
+        daemonStreamPath = nil
+
+        ingestQueue.async { [weak self] in
+            self?.pendingOutput = ""
         }
     }
 
@@ -908,7 +983,7 @@ class DaemonBridge: ObservableObject {
             // against [RS-DEC]/[UI L] (daemon decoder output) and [RS-TX]
             // (what got shipped toward the HID driver), it pinpoints where a
             // missing input is lost: decoder, IPC/JSON, UI, or dext.
-            if snapshot.side == "right" {
+            if traceFileHandle != nil, snapshot.side == "right" {
                 if snapshot.rightStickX != lastTraceRightX || snapshot.rightStickY != lastTraceRightY {
                     writeTrace(String(
                         format: "[RS-UI] RS=(%6d,%6d) LS=(%6d,%6d) btn=0x%06x",
@@ -918,7 +993,7 @@ class DaemonBridge: ObservableObject {
                     lastTraceRightX = snapshot.rightStickX
                     lastTraceRightY = snapshot.rightStickY
                 }
-            } else {
+            } else if traceFileHandle != nil {
                 if snapshot.leftStickX != lastTraceLeftX || snapshot.leftStickY != lastTraceLeftY {
                     writeTrace(String(
                         format: "[UI L] LS=(%6d,%6d) RS=(%6d,%6d) btn=0x%06x",
@@ -1047,11 +1122,18 @@ class DaemonBridge: ObservableObject {
             mouseActiveSide: stringValue(object["mouseActiveSide"], default: "right"),
             pointerMethod: PointerMethod(rawValue: intValue(object["pointerMethod"])) ?? .optical,
             gyroMouseSource: GyroMouseSource(rawValue: intValue(object["gyroMouseSource"])) ?? .fused,
+            gyroOutputMode: GyroOutputMode(rawValue: intValue(object["gyroOutputMode"])) ?? .mouse,
+            gyroStickFullRate: doubleValue(object["gyroStickFullRate"], default: 180),
+            gyroStickMinimumOutput: doubleValue(object["gyroStickMinimumOutput"], default: 0.12),
+            gyroStickResponseCurve: doubleValue(object["gyroStickResponseCurve"], default: 1),
             gyroAimingEnabled: (object["gyroAimingEnabled"] as? NSNumber)?.boolValue ?? false,
+            gyroOutputActive: (object["gyroOutputActive"] as? NSNumber)?.boolValue ?? false,
             gyroCalibrating: (object["gyroCalibrating"] as? NSNumber)?.boolValue ?? true,
             gyroActiveSource: stringValue(object["gyroActiveSource"], default: "none"),
-            leftGyroToggleBinding: GyroToggleBinding(rawValue: stringValue(object["leftGyroToggleBinding"], default: "capture")) ?? .capture,
-            rightGyroToggleBinding: GyroToggleBinding(rawValue: stringValue(object["rightGyroToggleBinding"], default: "chat")) ?? .chat,
+            gyroActivationMode: GyroActivationMode(rawValue: intValue(object["gyroActivationMode"])) ?? .hold,
+            gyroActivationSlot1: GyroActivationBinding(rawValue: stringValue(object["gyroActivationSlot1"], default: "zl")) ?? .zl,
+            gyroActivationSlot2: GyroActivationBinding(rawValue: stringValue(object["gyroActivationSlot2"], default: "none")) ?? .none,
+            gyroActivationSlot3: GyroActivationBinding(rawValue: stringValue(object["gyroActivationSlot3"], default: "none")) ?? .none,
             rssi: intValue(object["rssi"], default: 0)
         )
     }
@@ -1092,7 +1174,7 @@ class DaemonBridge: ObservableObject {
     private var pendingStateSnapshots: [String: ControllerState] = [:]
     private var pendingStatusSnapshots: [String: ControllerStatusSnapshot] = [:]
     private var mainApplyScheduled: Bool = false
-    private let mainApplyInterval: TimeInterval = 1.0 / 120.0
+    private let mainApplyInterval: TimeInterval = 1.0 / 30.0
 
     // Picker flicker guard. When the user picks a new mouseMode or
     // mouseSource, the daemon takes up to ~200 ms to read the control file,
@@ -1183,10 +1265,17 @@ class DaemonBridge: ObservableObject {
                         packetCount: 0, mouseMode: .normal,
                         mouseSource: .auto, mouseActiveSide: "right",
                         pointerMethod: .optical, gyroMouseSource: .fused,
-                        gyroAimingEnabled: false, gyroCalibrating: true,
+                        gyroOutputMode: .mouse,
+                        gyroStickFullRate: 180,
+                        gyroStickMinimumOutput: 0.12,
+                        gyroStickResponseCurve: 1,
+                        gyroAimingEnabled: false, gyroOutputActive: false,
+                        gyroCalibrating: true,
                         gyroActiveSource: "none",
-                        leftGyroToggleBinding: .capture,
-                        rightGyroToggleBinding: .chat,
+                        gyroActivationMode: .hold,
+                        gyroActivationSlot1: .zl,
+                        gyroActivationSlot2: .none,
+                        gyroActivationSlot3: .none,
                         rssi: 0
                     )
                 )
@@ -1277,7 +1366,6 @@ class DaemonBridge: ObservableObject {
 
         if changed {
             controllers = updated
-            stateRevision &+= 1
         }
     }
 
@@ -1304,7 +1392,6 @@ class DaemonBridge: ObservableObject {
             var updated = controllers
             updated[0].mouseMode = nextMode
             controllers = updated
-            stateRevision &+= 1
         }
     }
 
@@ -1322,7 +1409,6 @@ class DaemonBridge: ObservableObject {
                 updated[index].mouseMode = mode
             }
             controllers = updated
-            stateRevision &+= 1
         }
     }
 
@@ -1337,7 +1423,6 @@ class DaemonBridge: ObservableObject {
                 updated[index].mouseSource = source
             }
             controllers = updated
-            stateRevision &+= 1
         }
     }
 
@@ -1366,7 +1451,6 @@ class DaemonBridge: ObservableObject {
                 updated[index].gyroAimingEnabled = shouldEnableGyro
             }
             controllers = updated
-            stateRevision &+= 1
         }
     }
 
@@ -1388,7 +1472,42 @@ class DaemonBridge: ObservableObject {
                 updated[index].gyroAimingEnabled = shouldResume
             }
             controllers = updated
-            stateRevision &+= 1
+        }
+    }
+
+    func setGyroOutputMode(_ mode: GyroOutputMode) {
+        sendControlCommand(["cmd": "setGyroOutputMode", "value": mode.rawValue])
+        UserDefaults.standard.set(mode.rawValue, forKey: "mouse.gyroOutputMode")
+        if !controllers.isEmpty {
+            var updated = controllers
+            for index in updated.indices { updated[index].gyroOutputMode = mode }
+            controllers = updated
+        }
+    }
+
+    func setGyroStickSettings(fullRate: Double,
+                              minimumOutput: Double,
+                              responseCurve: Double) {
+        let appliedFullRate = min(max(fullRate, 30), 720)
+        let appliedMinimumOutput = min(max(minimumOutput, 0), 0.5)
+        let appliedResponseCurve = min(max(responseCurve, 0.25), 4)
+        UserDefaults.standard.set(appliedFullRate, forKey: "mouse.gyroStickFullRate")
+        UserDefaults.standard.set(appliedMinimumOutput, forKey: "mouse.gyroStickMinimumOutput")
+        UserDefaults.standard.set(appliedResponseCurve, forKey: "mouse.gyroStickResponseCurve")
+        sendControlCommand([
+            "cmd": "setGyroStickSettings",
+            "fullRate": appliedFullRate,
+            "minimumOutput": appliedMinimumOutput,
+            "responseCurve": appliedResponseCurve
+        ])
+        if !controllers.isEmpty {
+            var updated = controllers
+            for index in updated.indices {
+                updated[index].gyroStickFullRate = appliedFullRate
+                updated[index].gyroStickMinimumOutput = appliedMinimumOutput
+                updated[index].gyroStickResponseCurve = appliedResponseCurve
+            }
+            controllers = updated
         }
     }
 
@@ -1400,7 +1519,6 @@ class DaemonBridge: ObservableObject {
             var updated = controllers
             for index in updated.indices { updated[index].gyroAimingEnabled = enabled }
             controllers = updated
-            stateRevision &+= 1
         }
     }
 
@@ -1408,22 +1526,31 @@ class DaemonBridge: ObservableObject {
         sendControlCommand(["cmd": "calibrateGyro"])
     }
 
-    func setGyroToggleBindings(left: GyroToggleBinding, right: GyroToggleBinding) {
-        UserDefaults.standard.set(left.rawValue, forKey: "mouse.gyroToggleLeft")
-        UserDefaults.standard.set(right.rawValue, forKey: "mouse.gyroToggleRight")
+    func setGyroActivation(mode: GyroActivationMode,
+                           slot1: GyroActivationBinding,
+                           slot2: GyroActivationBinding,
+                           slot3: GyroActivationBinding) {
+        UserDefaults.standard.set(mode.rawValue, forKey: "mouse.gyroActivationMode")
+        UserDefaults.standard.set(slot1.rawValue, forKey: "mouse.gyroActivationSlot1")
+        UserDefaults.standard.set(slot2.rawValue, forKey: "mouse.gyroActivationSlot2")
+        UserDefaults.standard.set(slot3.rawValue, forKey: "mouse.gyroActivationSlot3")
         sendControlCommand([
-            "cmd": "setGyroToggleBindings",
-            "left": left.rawValue,
-            "right": right.rawValue
+            "cmd": "setGyroActivation",
+            "mode": mode.rawValue,
+            "slot1": slot1.rawValue,
+            "slot2": slot2.rawValue,
+            "slot3": slot3.rawValue
         ])
         if !controllers.isEmpty {
             var updated = controllers
             for index in updated.indices {
-                updated[index].leftGyroToggleBinding = left
-                updated[index].rightGyroToggleBinding = right
+                updated[index].gyroActivationMode = mode
+                updated[index].gyroActivationSlot1 = slot1
+                updated[index].gyroActivationSlot2 = slot2
+                updated[index].gyroActivationSlot3 = slot3
+                updated[index].gyroOutputActive = false
             }
             controllers = updated
-            stateRevision &+= 1
         }
     }
 
@@ -1461,13 +1588,26 @@ class DaemonBridge: ObservableObject {
         let opticalSource = MouseSource(rawValue: defaults.object(forKey: "mouse.opticalSource") as? Int ?? MouseSource.auto.rawValue) ?? .auto
         let method = PointerMethod(rawValue: defaults.object(forKey: "mouse.pointerMethod") as? Int ?? PointerMethod.optical.rawValue) ?? .optical
         let gyroSource = GyroMouseSource(rawValue: defaults.object(forKey: "mouse.gyroSource") as? Int ?? GyroMouseSource.fused.rawValue) ?? .fused
-        let leftBinding = GyroToggleBinding(rawValue: defaults.string(forKey: "mouse.gyroToggleLeft") ?? "capture") ?? .capture
-        let rightBinding = GyroToggleBinding(rawValue: defaults.string(forKey: "mouse.gyroToggleRight") ?? "chat") ?? .chat
+        let gyroOutput = GyroOutputMode(rawValue: defaults.object(forKey: "mouse.gyroOutputMode") as? Int ?? GyroOutputMode.mouse.rawValue) ?? .mouse
+        let gyroStickFullRate = defaults.object(forKey: "mouse.gyroStickFullRate") as? Double ?? 180
+        let gyroStickMinimumOutput = defaults.object(forKey: "mouse.gyroStickMinimumOutput") as? Double ?? 0.12
+        let gyroStickResponseCurve = defaults.object(forKey: "mouse.gyroStickResponseCurve") as? Double ?? 1
+        let activationMode = GyroActivationMode(rawValue: defaults.object(forKey: "mouse.gyroActivationMode") as? Int ?? GyroActivationMode.hold.rawValue) ?? .hold
+        let activationSlot1 = GyroActivationBinding(rawValue: defaults.string(forKey: "mouse.gyroActivationSlot1") ?? "zl") ?? .zl
+        let activationSlot2 = GyroActivationBinding(rawValue: defaults.string(forKey: "mouse.gyroActivationSlot2") ?? "none") ?? .none
+        let activationSlot3 = GyroActivationBinding(rawValue: defaults.string(forKey: "mouse.gyroActivationSlot3") ?? "none") ?? .none
         setMouseMode(mode)
         setMouseSource(opticalSource)
         setPointerMethod(method)
         setGyroMouseSource(gyroSource)
-        setGyroToggleBindings(left: leftBinding, right: rightBinding)
+        setGyroOutputMode(gyroOutput)
+        setGyroStickSettings(fullRate: gyroStickFullRate,
+                             minimumOutput: gyroStickMinimumOutput,
+                             responseCurve: gyroStickResponseCurve)
+        setGyroActivation(mode: activationMode,
+                          slot1: activationSlot1,
+                          slot2: activationSlot2,
+                          slot3: activationSlot3)
         setGyroAimingEnabled(false)
     }
 
@@ -1519,14 +1659,6 @@ class DaemonBridge: ObservableObject {
     func stopNFC() {
         TelemetryStore.shared.append("NFC scan stopped.")
         sendControlCommand(["cmd": "stopNFC"])
-    }
-
-    var telemetryLogPath: String {
-        TelemetryStore.shared.telemetryLogPath
-    }
-
-    func revealTelemetryLog() {
-        TelemetryStore.shared.revealLog()
     }
 
     func copyTelemetryToClipboard() {
@@ -1595,14 +1727,13 @@ class DaemonBridge: ObservableObject {
             updated[index].status = status
         }
         controllers = updated
-        stateRevision &+= 1
     }
 
     private func handleDaemonTerminated() {
         daemonApplication = nil
         daemonProcess = nil
         outputPipe = nil
-        stopLogPolling()
+        stopDaemonStream()
         isDaemonRunning = false
         TelemetryStore.shared.append("[daemon] helper process terminated")
         if shouldRestartAfterTermination {

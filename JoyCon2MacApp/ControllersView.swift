@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ControllersView: View {
     @EnvironmentObject var daemonBridge: DaemonBridge
+    @EnvironmentObject var controllerStore: ControllerStore
 
     private let columns = [
         GridItem(.adaptive(minimum: 300, maximum: 420), spacing: 14, alignment: .top)
@@ -9,12 +10,12 @@ struct ControllersView: View {
 
     var body: some View {
         Group {
-            if daemonBridge.controllers.isEmpty {
+            if controllerStore.controllers.isEmpty {
                 emptyState
             } else {
                 ScrollView {
                     LazyVGrid(columns: columns, alignment: .leading, spacing: 14) {
-                        ForEach(daemonBridge.controllers) { controller in
+                        ForEach(controllerStore.controllers) { controller in
                             ControllerCard(controller: controller)
                         }
                     }
@@ -274,5 +275,6 @@ private struct MetricTile: View {
 #Preview {
     ControllersView()
         .environmentObject(DaemonBridge.shared)
+        .environmentObject(DaemonBridge.shared.controllerStore)
         .frame(width: 800, height: 600)
 }

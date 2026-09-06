@@ -42,7 +42,7 @@ enum GyroSource: String, CaseIterable, Identifiable {
 }
 
 struct GyroView: View {
-    @EnvironmentObject var daemonBridge: DaemonBridge
+    @EnvironmentObject var controllerStore: ControllerStore
     @State private var showRawValues = false
     @State private var gyroSource: GyroSource = .fused
     // Defaults to OFF because joycon2cpp's known-good Switch 2 path does
@@ -53,10 +53,10 @@ struct GyroView: View {
     @State private var invertRightAxes: Bool = false
 
     private var leftController: ControllerState? {
-        daemonBridge.controllers.first { $0.side == "left" }
+        controllerStore.controllers.first { $0.side == "left" }
     }
     private var rightController: ControllerState? {
-        daemonBridge.controllers.first { $0.side == "right" }
+        controllerStore.controllers.first { $0.side == "right" }
     }
 
     private var anyController: ControllerState? {
@@ -506,6 +506,6 @@ private struct JoyConShape: Shape {
 
 #Preview {
     GyroView()
-        .environmentObject(DaemonBridge.shared)
+        .environmentObject(DaemonBridge.shared.controllerStore)
         .frame(width: 800, height: 600)
 }

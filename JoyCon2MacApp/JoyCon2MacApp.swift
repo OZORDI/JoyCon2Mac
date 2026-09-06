@@ -11,6 +11,7 @@ struct JoyCon2MacApp: App {
         WindowGroup {
             MainWindow()
                 .environmentObject(daemonBridge)
+                .environmentObject(daemonBridge.controllerStore)
                 .frame(minWidth: 800, minHeight: 600)
         }
         .commands {

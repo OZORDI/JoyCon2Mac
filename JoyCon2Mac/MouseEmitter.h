@@ -38,6 +38,17 @@ typedef NS_ENUM(NSInteger, GyroMouseSource) {
     GyroMouseSourceRight = 2
 };
 
+typedef NS_ENUM(NSInteger, GyroOutputMode) {
+    GyroOutputModeMouse      = 0,
+    GyroOutputModeRightStick = 1
+};
+
+typedef NS_ENUM(NSInteger, GyroActivationMode) {
+    GyroActivationModeContinuous = 0,
+    GyroActivationModeHold       = 1,
+    GyroActivationModeToggle     = 2
+};
+
 struct GyroPointerRate {
     double timestamp = 0;
     double pitch = 0;
@@ -81,10 +92,9 @@ struct GyroPointerSample {
     BOOL _gyroEmitClockValid;
     double _gyroFractionX;
     double _gyroFractionY;
-    BOOL _gyroTogglePressedLeft;
-    BOOL _gyroTogglePressedRight;
-    double _gyroLastToggleTapLeft;
-    double _gyroLastToggleTapRight;
+    uint64_t _gyroActivationPressedBindings;
+    BOOL _gyroToggleLatched;
+    BOOL _gyroOutputActive;
     uint32_t _gyroButtonStateLeft;
     uint32_t _gyroButtonStateRight;
     double _gyroButtonTimestampLeft;
@@ -94,6 +104,8 @@ struct GyroPointerSample {
     double _gyroStickTimestampLeft;
     double _gyroStickTimestampRight;
     double _gyroScrollAccumulator;
+    double _gyroRightStickX;
+    double _gyroRightStickY;
     NSString *_gyroActiveSourceName;
     BOOL _gyroCalibrating;
     BOOL _opticalGestureChordActive;
@@ -106,9 +118,15 @@ struct GyroPointerSample {
 @property (nonatomic, assign) MouseSource source;
 @property (nonatomic, assign) PointerMethod pointerMethod;
 @property (nonatomic, assign) GyroMouseSource gyroSource;
+@property (nonatomic, assign) GyroOutputMode gyroOutputMode;
+@property (nonatomic, assign) GyroActivationMode gyroActivationMode;
 @property (nonatomic, assign, getter=isGyroAimingEnabled) BOOL gyroAimingEnabled;
-@property (nonatomic, copy) NSString *leftGyroToggleBinding;
-@property (nonatomic, copy) NSString *rightGyroToggleBinding;
+@property (nonatomic, assign) double gyroStickFullDeflectionRate;
+@property (nonatomic, assign) double gyroStickMinimumOutput;
+@property (nonatomic, assign) double gyroStickResponseCurve;
+@property (nonatomic, copy) NSString *gyroActivationBinding1;
+@property (nonatomic, copy) NSString *gyroActivationBinding2;
+@property (nonatomic, copy) NSString *gyroActivationBinding3;
 @property (nonatomic, assign) DriverKitClient *driverClient;
 
 // The side the last optical sample was actually consumed from. Exposed so
@@ -116,6 +134,7 @@ struct GyroPointerSample {
 @property (nonatomic, readonly, assign) JoyConSide lastActiveSide;
 @property (nonatomic, readonly, copy) NSString *gyroActiveSourceName;
 @property (nonatomic, readonly, assign, getter=isGyroCalibrating) BOOL gyroCalibrating;
+@property (nonatomic, readonly, assign, getter=isGyroOutputActive) BOOL gyroOutputActive;
 
 - (instancetype)initWithDriverClient:(DriverKitClient *)client;
 
@@ -137,12 +156,14 @@ struct GyroPointerSample {
         mouseDistance:(uint16_t)mouseDistance;
 
 // Feed the latest per-side IMU and buttons into the free-air pointer path.
-// Returns the physical button bit consumed as the gyro activation toggle,
-// or zero when no gamepad button needs suppressing.
-- (uint32_t)processGyroMotion:(MotionData)motion
-                         side:(JoyConSide)side
-                  buttonState:(uint32_t)buttonState
-                 stickReading:(StickData)stickReading;
+// Activation buttons are conditions, not remaps, and always pass through to
+// the virtual gamepad unchanged.
+- (void)processGyroMotion:(MotionData)motion
+                     side:(JoyConSide)side
+              buttonState:(uint32_t)buttonState
+             stickReading:(StickData)stickReading;
+
+- (StickData)composeGyroRightStickWithPhysical:(StickData)physicalStick;
 
 - (void)requestGyroCalibration;
 - (void)resetGyroAiming;

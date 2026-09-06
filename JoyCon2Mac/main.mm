@@ -53,15 +53,16 @@ static bool g_showDetailedOutput = false;
 static bool g_emitJSON = false;
 static bool g_enableGamepad = true;
 static bool g_sdlOnlyMode = false;
-static bool g_debugInput = true;    // targeted dpad + right-stick trace, on by default
-                                    // (change-triggered — zero output when idle).
-                                    // Disable with --no-debug-input.
+static bool g_debugInput = false;   // targeted dpad + right-stick trace, opt-in
+                                    // with --debug-input to avoid routine disk I/O.
 static FILE *g_debugInputFile = nullptr;    // mirrors trace lines to a file you can tail
 static FILE *g_jsonFile = nullptr;
+static bool g_jsonFileRequested = false;
+static NSString *g_jsonOutputPath = nil;
 static NSDate *g_lastPrintTime = nil;
-static NSDate *g_lastJSONLeftTime = nil;
-static NSDate *g_lastJSONRightTime = nil;
-static const NSTimeInterval kJSONStateIntervalSeconds = 1.0 / 120.0;
+static CFAbsoluteTime g_lastJSONLeftTime = 0;
+static CFAbsoluteTime g_lastJSONRightTime = 0;
+static const CFTimeInterval kJSONStateIntervalSeconds = 1.0 / 30.0;
 static DriverKitClient *g_driverClient = nil;
 static MouseEmitter *g_mouseEmitter = nil;
 static BLEManager *g_bleManager = nil;
@@ -89,8 +90,6 @@ static std::string g_railBindingLeftSL = "none";
 static std::string g_railBindingLeftSR = "none";
 static std::string g_railBindingRightSL = "none";
 static std::string g_railBindingRightSR = "none";
-static uint32_t g_gyroConsumedLeft = 0;
-static uint32_t g_gyroConsumedRight = 0;
 
 // Write one formatted debug-input line to stderr AND (if opened) to the
 // mirror file so you can just `tail -f` the file without wrangling the
@@ -189,10 +188,13 @@ static void traceRightStickTransmit(uint32_t packetCount, JoyConSide side, const
 
 
 static void emitJSONLine(const std::string& line) {
-    std::cout << line << std::endl;
     if (g_jsonFile) {
-        fprintf(g_jsonFile, "%s\n", line.c_str());
-        fflush(g_jsonFile);
+        if (fprintf(g_jsonFile, "%s\n", line.c_str()) < 0 || fflush(g_jsonFile) != 0) {
+            fclose(g_jsonFile);
+            g_jsonFile = nullptr;
+        }
+    } else if (!g_jsonFileRequested) {
+        std::cout << line << std::endl;
     }
 }
 
@@ -216,8 +218,6 @@ static std::string jsonEscape(const char *value) {
 void onJoyConStatus(JoyConSide side, const char *status, const char *message, const char *name) {
     if (status && std::strcmp(status, "disconnected") == 0 && g_mouseEmitter) {
         [g_mouseEmitter resetGyroAiming];
-        if (side == JoyConSide::Left) g_gyroConsumedLeft = 0;
-        else g_gyroConsumedRight = 0;
     }
     if (!g_emitJSON) {
         return;
@@ -567,6 +567,30 @@ static void applyControlCommand(NSDictionary *command) {
         g_mouseEmitter.gyroSource = (GyroMouseSource)raw;
         emitDaemonEvent("gyroMouseSource",
                         [[NSString stringWithFormat:@"applied=%d", raw] UTF8String]);
+    } else if ([cmd isEqualToString:@"setGyroOutputMode"]) {
+        if (!g_mouseEmitter) return;
+        NSNumber *value = command[@"value"];
+        if (![value isKindOfClass:[NSNumber class]]) return;
+        int raw = value.intValue;
+        if (raw < 0 || raw > 1) return;
+        g_mouseEmitter.gyroOutputMode = (GyroOutputMode)raw;
+        emitDaemonEvent("gyroOutputMode",
+                        [[NSString stringWithFormat:@"applied=%d", raw] UTF8String]);
+    } else if ([cmd isEqualToString:@"setGyroStickSettings"]) {
+        if (!g_mouseEmitter) return;
+        NSNumber *fullRate = command[@"fullRate"];
+        NSNumber *minimumOutput = command[@"minimumOutput"];
+        NSNumber *responseCurve = command[@"responseCurve"];
+        if ([fullRate isKindOfClass:[NSNumber class]]) {
+            g_mouseEmitter.gyroStickFullDeflectionRate = fullRate.doubleValue;
+        }
+        if ([minimumOutput isKindOfClass:[NSNumber class]]) {
+            g_mouseEmitter.gyroStickMinimumOutput = minimumOutput.doubleValue;
+        }
+        if ([responseCurve isKindOfClass:[NSNumber class]]) {
+            g_mouseEmitter.gyroStickResponseCurve = responseCurve.doubleValue;
+        }
+        emitDaemonEvent("gyroStickSettings", "applied=1");
     } else if ([cmd isEqualToString:@"setGyroAimingEnabled"]) {
         if (!g_mouseEmitter) return;
         NSNumber *value = command[@"value"];
@@ -577,19 +601,32 @@ static void applyControlCommand(NSDictionary *command) {
         if (!g_mouseEmitter) return;
         [g_mouseEmitter requestGyroCalibration];
         emitDaemonEvent("gyroCalibration", "requested=1");
-    } else if ([cmd isEqualToString:@"setGyroToggleBindings"]) {
+    } else if ([cmd isEqualToString:@"setGyroActivation"]) {
         if (!g_mouseEmitter) return;
-        NSString *left = command[@"left"];
-        NSString *right = command[@"right"];
-        NSSet *leftAllowed = [NSSet setWithArray:@[@"capture", @"minus", @"sl", @"sr", @"stick"]];
-        NSSet *rightAllowed = [NSSet setWithArray:@[@"chat", @"home", @"plus", @"sl", @"sr", @"stick"]];
-        if ([left isKindOfClass:[NSString class]] && [leftAllowed containsObject:left]) {
-            g_mouseEmitter.leftGyroToggleBinding = left;
+        NSNumber *mode = command[@"mode"];
+        NSString *slot1 = command[@"slot1"];
+        NSString *slot2 = command[@"slot2"];
+        NSString *slot3 = command[@"slot3"];
+        NSSet *allowed = [NSSet setWithArray:@[
+            @"none", @"dpadUp", @"dpadDown", @"dpadLeft", @"dpadRight",
+            @"l", @"zl", @"minus", @"leftStick", @"capture", @"leftSL", @"leftSR",
+            @"a", @"b", @"x", @"y", @"r", @"zr", @"plus", @"rightStick",
+            @"home", @"chat", @"rightSL", @"rightSR"
+        ]];
+        if (![mode isKindOfClass:[NSNumber class]]
+            || mode.intValue < GyroActivationModeContinuous
+            || mode.intValue > GyroActivationModeToggle
+            || ![slot1 isKindOfClass:[NSString class]] || ![allowed containsObject:slot1]
+            || ![slot2 isKindOfClass:[NSString class]] || ![allowed containsObject:slot2]
+            || ![slot3 isKindOfClass:[NSString class]] || ![allowed containsObject:slot3]) {
+            emitDaemonEvent("gyroActivation", "applied=0 invalid=1");
+            return;
         }
-        if ([right isKindOfClass:[NSString class]] && [rightAllowed containsObject:right]) {
-            g_mouseEmitter.rightGyroToggleBinding = right;
-        }
-        emitDaemonEvent("gyroToggleBindings", "applied=1");
+        g_mouseEmitter.gyroActivationMode = (GyroActivationMode)mode.intValue;
+        g_mouseEmitter.gyroActivationBinding1 = slot1;
+        g_mouseEmitter.gyroActivationBinding2 = slot2;
+        g_mouseEmitter.gyroActivationBinding3 = slot3;
+        emitDaemonEvent("gyroActivation", "applied=1");
     } else if ([cmd isEqualToString:@"setSDLOnlyMode"]) {
         NSNumber *value = command[@"value"];
         if (![value isKindOfClass:[NSNumber class]]) return;
@@ -834,9 +871,10 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
         return;
     }
 
-    NSDate *lastJSONTime = side == JoyConSide::Right ? g_lastJSONRightTime : g_lastJSONLeftTime;
-    NSDate *now = [NSDate date];
-    if (lastJSONTime && [now timeIntervalSinceDate:lastJSONTime] < kJSONStateIntervalSeconds) {
+    const CFAbsoluteTime lastJSONTime = side == JoyConSide::Right
+        ? g_lastJSONRightTime : g_lastJSONLeftTime;
+    const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (lastJSONTime > 0 && now - lastJSONTime < kJSONStateIntervalSeconds) {
         return;
     }
     if (side == JoyConSide::Right) {
@@ -859,11 +897,20 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
     const char *mouseActive = g_mouseEmitter && g_mouseEmitter.lastActiveSide == JoyConSide::Left ? "left" : "right";
     int pointerMethod = g_mouseEmitter ? (int)g_mouseEmitter.pointerMethod : 0;
     int gyroMouseSource = g_mouseEmitter ? (int)g_mouseEmitter.gyroSource : 0;
+    int gyroOutputMode = g_mouseEmitter ? (int)g_mouseEmitter.gyroOutputMode : 0;
+    int gyroActivationMode = g_mouseEmitter
+        ? (int)g_mouseEmitter.gyroActivationMode
+        : (int)GyroActivationModeHold;
+    double gyroStickFullRate = g_mouseEmitter ? g_mouseEmitter.gyroStickFullDeflectionRate : 180.0;
+    double gyroStickMinimumOutput = g_mouseEmitter ? g_mouseEmitter.gyroStickMinimumOutput : 0.12;
+    double gyroStickResponseCurve = g_mouseEmitter ? g_mouseEmitter.gyroStickResponseCurve : 1.0;
     bool gyroAimingEnabled = g_mouseEmitter && g_mouseEmitter.isGyroAimingEnabled;
+    bool gyroOutputActive = g_mouseEmitter && g_mouseEmitter.isGyroOutputActive;
     bool gyroCalibrating = g_mouseEmitter && g_mouseEmitter.isGyroCalibrating;
     const char *gyroActiveSource = g_mouseEmitter ? [g_mouseEmitter.gyroActiveSourceName UTF8String] : "none";
-    const char *leftGyroToggle = g_mouseEmitter ? [g_mouseEmitter.leftGyroToggleBinding UTF8String] : "capture";
-    const char *rightGyroToggle = g_mouseEmitter ? [g_mouseEmitter.rightGyroToggleBinding UTF8String] : "chat";
+    const char *gyroActivationSlot1 = g_mouseEmitter ? [g_mouseEmitter.gyroActivationBinding1 UTF8String] : "zl";
+    const char *gyroActivationSlot2 = g_mouseEmitter ? [g_mouseEmitter.gyroActivationBinding2 UTF8String] : "none";
+    const char *gyroActivationSlot3 = g_mouseEmitter ? [g_mouseEmitter.gyroActivationBinding3 UTF8String] : "none";
 
     std::ostringstream out;
     out << "{"
@@ -905,11 +952,18 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
         << "\"mouseActiveSide\":\"" << mouseActive << "\","
         << "\"pointerMethod\":" << pointerMethod << ","
         << "\"gyroMouseSource\":" << gyroMouseSource << ","
+        << "\"gyroOutputMode\":" << gyroOutputMode << ","
+        << "\"gyroActivationMode\":" << gyroActivationMode << ","
+        << "\"gyroStickFullRate\":" << gyroStickFullRate << ","
+        << "\"gyroStickMinimumOutput\":" << gyroStickMinimumOutput << ","
+        << "\"gyroStickResponseCurve\":" << gyroStickResponseCurve << ","
         << "\"gyroAimingEnabled\":" << (gyroAimingEnabled ? "true" : "false") << ","
+        << "\"gyroOutputActive\":" << (gyroOutputActive ? "true" : "false") << ","
         << "\"gyroCalibrating\":" << (gyroCalibrating ? "true" : "false") << ","
         << "\"gyroActiveSource\":\"" << gyroActiveSource << "\","
-        << "\"leftGyroToggleBinding\":\"" << leftGyroToggle << "\","
-        << "\"rightGyroToggleBinding\":\"" << rightGyroToggle << "\""
+        << "\"gyroActivationSlot1\":\"" << gyroActivationSlot1 << "\","
+        << "\"gyroActivationSlot2\":\"" << gyroActivationSlot2 << "\","
+        << "\"gyroActivationSlot3\":\"" << gyroActivationSlot3 << "\""
         << "}";
     emitJSONLine(out.str());
 }
@@ -975,14 +1029,12 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     }
     MotionData sideMotion = side == JoyConSide::Left ? g_state.motionLeft : g_state.motionRight;
     StickData gyroStick = side == JoyConSide::Left ? g_state.leftStick : g_state.rightStick;
-    uint32_t gyroConsumedMask = g_mouseEmitter
-        ? [g_mouseEmitter processGyroMotion:sideMotion
-                                      side:side
-                               buttonState:sideButtons
-                              stickReading:gyroStick]
-        : 0;
-    if (side == JoyConSide::Left) g_gyroConsumedLeft = gyroConsumedMask;
-    else g_gyroConsumedRight = gyroConsumedMask;
+    if (g_mouseEmitter) {
+        [g_mouseEmitter processGyroMotion:sideMotion
+                                    side:side
+                             buttonState:sideButtons
+                            stickReading:gyroStick];
+    }
     g_state.battery = DecodeBattery(buffer);
     if (side == JoyConSide::Left) {
         g_state.batteryLeft = g_state.battery;
@@ -1030,8 +1082,6 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     StickData sideStickForGamepad  = (side == JoyConSide::Right)
                                         ? g_state.rightStick
                                         : g_state.leftStick;
-    sideButtonsForGamepad &= ~gyroConsumedMask;
-
     // Always feed the emitter — even when mouse mode is Off — so it can
     // keep its per-side surface tracking up to date and drive the "Active"
     // badge in the GUI. The emitter short-circuits internally if the mode
@@ -1064,8 +1114,6 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         StickData rightStickForReport  = g_state.rightStick;
         uint8_t triggerLForReport = g_state.triggerL;
         uint8_t triggerRForReport = g_state.triggerR;
-        leftButtonsForReport &= ~g_gyroConsumedLeft;
-        rightButtonsForReport &= ~g_gyroConsumedRight;
         if (side == JoyConSide::Left) {
             leftButtonsForReport = sideButtonsForGamepad;
             leftStickForReport   = sideStickForGamepad;
@@ -1086,6 +1134,11 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
             rightButtonsForReport = 0;
             rightStickForReport = { 0, 0, 0, 0 };
             triggerRForReport = 0;
+        }
+
+        if (g_mouseEmitter) {
+            rightStickForReport =
+                [g_mouseEmitter composeGyroRightStickWithPhysical:rightStickForReport];
         }
 
         applyRailBindingsToReport(leftButtonsForReport, rightButtonsForReport);
@@ -1212,20 +1265,12 @@ int main(int argc, const char * argv[]) {
             else if (arg == "--json") g_emitJSON = true;
             else if (arg == "--json-file" && i + 1 < argc) {
                 g_emitJSON = true;
+                g_jsonFileRequested = true;
                 const char *jsonPath = argv[++i];
+                g_jsonOutputPath = [NSString stringWithUTF8String:jsonPath];
                 g_jsonFile = fopen(jsonPath, "a");
                 if (g_jsonFile) {
                     setvbuf(g_jsonFile, nullptr, _IOLBF, 0);
-                }
-                // Mirror the debug-input trace next to daemon.jsonl so you
-                // can `tail -f ~/Library/Application Support/JoyCon2Mac/input-trace.log`
-                // without digging through the unified system log.
-                NSString *jsonNSPath = [NSString stringWithUTF8String:jsonPath];
-                NSString *traceNSPath = [[jsonNSPath stringByDeletingLastPathComponent]
-                                          stringByAppendingPathComponent:@"input-trace.log"];
-                g_debugInputFile = fopen(traceNSPath.UTF8String, "a");
-                if (g_debugInputFile) {
-                    setvbuf(g_debugInputFile, nullptr, _IOLBF, 0);
                 }
             }
             else if (arg == "--control-file" && i + 1 < argc) {
@@ -1236,8 +1281,19 @@ int main(int argc, const char * argv[]) {
             }
             else if (arg == "-h" || arg == "--help") { printUsage(); return 0; }
             else if (arg == "--no-gamepad") g_enableGamepad = false;
+            else if (arg == "--debug-input") g_debugInput = true;
             else if (arg == "--no-debug-input") g_debugInput = false;
             else if (arg == "--sdl-only") g_sdlOnlyMode = true;
+        }
+
+        signal(SIGPIPE, SIG_IGN);
+        if (g_debugInput && g_jsonOutputPath) {
+            NSString *traceNSPath = [[g_jsonOutputPath stringByDeletingLastPathComponent]
+                                      stringByAppendingPathComponent:@"input-trace.log"];
+            g_debugInputFile = fopen(traceNSPath.UTF8String, "a");
+            if (g_debugInputFile) {
+                setvbuf(g_debugInputFile, nullptr, _IOLBF, 0);
+            }
         }
         
         printUsage();

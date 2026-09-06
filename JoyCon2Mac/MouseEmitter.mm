@@ -6,6 +6,14 @@
 #include <cstdint>
 #include <ctime>
 
+struct PointerRates;
+
+enum class GyroRateSelectionResult {
+    Unavailable,
+    NotClockPacket,
+    Ready
+};
+
 // Structurally a port of the single-Right-JoyCon mouse handler from
 // joycon2cpp/testapp/src/testapp.cpp, extended so the left Joy-Con 2 can
 // also drive the mouse. joycon2cpp's reference only wires it up for the
@@ -70,9 +78,17 @@
 - (BOOL)isSideOnSurface:(JoyConSide)side;
 - (JoyConSide)resolvedActiveSide;
 - (void)emitGyroPointerForPacketSide:(JoyConSide)side now:(double)now;
+- (void)updateGyroRightStickForPacketSide:(JoyConSide)side now:(double)now;
+- (GyroRateSelectionResult)selectGyroRatesForPacketSide:(JoyConSide)side
+                                                     now:(double)now
+                                                   rates:(PointerRates *)rates
+                                               deltaTime:(double *)deltaTime;
 - (void)updateGyroCalibration:(GyroPointerSample &)sample now:(double)now;
 - (void)updateGyroCalibrationState;
 - (void)updateGyroMouseButtons;
+- (uint64_t)pressedGyroActivationBindingsAt:(double)now;
+- (void)updateGyroOutputActive;
+- (void)resetGyroOutputState;
 - (void)resetOpticalGesture;
 - (void)routeOpticalGestureDeltaX:(int)dx deltaY:(int)dy;
 - (void)emitControlArrowUsage:(uint8_t)usage;
@@ -92,20 +108,96 @@ static MotionData CanonicalGyroMotion(MotionData motion, JoyConSide side) {
     return motion;
 }
 
-static uint32_t ToggleMaskForBinding(NSString *binding, JoyConSide side) {
-    if (side == JoyConSide::Left) {
-        if ([binding isEqualToString:@"minus"]) return BTN_LEFT_MINUS;
-        if ([binding isEqualToString:@"sl"]) return BTN_LEFT_SLL;
-        if ([binding isEqualToString:@"sr"]) return BTN_LEFT_SRL;
-        if ([binding isEqualToString:@"stick"]) return BTN_LEFT_L3;
-        return BTN_LEFT_CAPTURE;
-    }
-    if ([binding isEqualToString:@"home"]) return BTN_RIGHT_HOME;
-    if ([binding isEqualToString:@"plus"]) return BTN_RIGHT_PLUS;
-    if ([binding isEqualToString:@"sl"]) return BTN_RIGHT_SLR;
-    if ([binding isEqualToString:@"sr"]) return BTN_RIGHT_SRR;
-    if ([binding isEqualToString:@"stick"]) return BTN_RIGHT_R3;
-    return BTN_RIGHT_CHAT;
+enum class GyroActivationBindingID : uint8_t {
+    DpadUp,
+    DpadDown,
+    DpadLeft,
+    DpadRight,
+    L,
+    ZL,
+    Minus,
+    LeftStick,
+    Capture,
+    LeftSL,
+    LeftSR,
+    A,
+    B,
+    X,
+    Y,
+    R,
+    ZR,
+    Plus,
+    RightStick,
+    Home,
+    Chat,
+    RightSL,
+    RightSR
+};
+
+struct ResolvedGyroActivationBinding {
+    JoyConSide side;
+    uint32_t mask;
+    GyroActivationBindingID id;
+    bool valid;
+};
+
+static ResolvedGyroActivationBinding ResolveGyroActivationBinding(NSString *binding) {
+    if ([binding isEqualToString:@"dpadUp"])
+        return {JoyConSide::Left, BTN_LEFT_UP, GyroActivationBindingID::DpadUp, true};
+    if ([binding isEqualToString:@"dpadDown"])
+        return {JoyConSide::Left, BTN_LEFT_DOWN, GyroActivationBindingID::DpadDown, true};
+    if ([binding isEqualToString:@"dpadLeft"])
+        return {JoyConSide::Left, BTN_LEFT_LEFT, GyroActivationBindingID::DpadLeft, true};
+    if ([binding isEqualToString:@"dpadRight"])
+        return {JoyConSide::Left, BTN_LEFT_RIGHT, GyroActivationBindingID::DpadRight, true};
+    if ([binding isEqualToString:@"l"])
+        return {JoyConSide::Left, BTN_LEFT_L, GyroActivationBindingID::L, true};
+    if ([binding isEqualToString:@"zl"])
+        return {JoyConSide::Left, BTN_LEFT_ZL, GyroActivationBindingID::ZL, true};
+    if ([binding isEqualToString:@"minus"])
+        return {JoyConSide::Left, BTN_LEFT_MINUS, GyroActivationBindingID::Minus, true};
+    if ([binding isEqualToString:@"leftStick"])
+        return {JoyConSide::Left, BTN_LEFT_L3, GyroActivationBindingID::LeftStick, true};
+    if ([binding isEqualToString:@"capture"])
+        return {JoyConSide::Left, BTN_LEFT_CAPTURE, GyroActivationBindingID::Capture, true};
+    if ([binding isEqualToString:@"leftSL"])
+        return {JoyConSide::Left, BTN_LEFT_SLL, GyroActivationBindingID::LeftSL, true};
+    if ([binding isEqualToString:@"leftSR"])
+        return {JoyConSide::Left, BTN_LEFT_SRL, GyroActivationBindingID::LeftSR, true};
+    if ([binding isEqualToString:@"a"])
+        return {JoyConSide::Right, BTN_RIGHT_A, GyroActivationBindingID::A, true};
+    if ([binding isEqualToString:@"b"])
+        return {JoyConSide::Right, BTN_RIGHT_B, GyroActivationBindingID::B, true};
+    if ([binding isEqualToString:@"x"])
+        return {JoyConSide::Right, BTN_RIGHT_X, GyroActivationBindingID::X, true};
+    if ([binding isEqualToString:@"y"])
+        return {JoyConSide::Right, BTN_RIGHT_Y, GyroActivationBindingID::Y, true};
+    if ([binding isEqualToString:@"r"])
+        return {JoyConSide::Right, BTN_RIGHT_R, GyroActivationBindingID::R, true};
+    if ([binding isEqualToString:@"zr"])
+        return {JoyConSide::Right, BTN_RIGHT_ZR, GyroActivationBindingID::ZR, true};
+    if ([binding isEqualToString:@"plus"])
+        return {JoyConSide::Right, BTN_RIGHT_PLUS, GyroActivationBindingID::Plus, true};
+    if ([binding isEqualToString:@"rightStick"])
+        return {JoyConSide::Right, BTN_RIGHT_R3, GyroActivationBindingID::RightStick, true};
+    if ([binding isEqualToString:@"home"])
+        return {JoyConSide::Right, BTN_RIGHT_HOME, GyroActivationBindingID::Home, true};
+    if ([binding isEqualToString:@"chat"])
+        return {JoyConSide::Right, BTN_RIGHT_CHAT, GyroActivationBindingID::Chat, true};
+    if ([binding isEqualToString:@"rightSL"])
+        return {JoyConSide::Right, BTN_RIGHT_SLR, GyroActivationBindingID::RightSL, true};
+    if ([binding isEqualToString:@"rightSR"])
+        return {JoyConSide::Right, BTN_RIGHT_SRR, GyroActivationBindingID::RightSR, true};
+    return {JoyConSide::Left, 0, GyroActivationBindingID::DpadUp, false};
+}
+
+static uint64_t GyroActivationBindingBit(GyroActivationBindingID id) {
+    return uint64_t{1} << static_cast<uint8_t>(id);
+}
+
+static NSString *NormalizedGyroActivationBinding(NSString *binding) {
+    if ([binding isEqualToString:@"none"]) return @"none";
+    return ResolveGyroActivationBinding(binding).valid ? [binding copy] : @"none";
 }
 
 static int16_t ClampMouseDelta(int value) {
@@ -121,6 +213,18 @@ static int ExtractWholeMouseDelta(double value) {
     return value >= 0
         ? static_cast<int>(std::floor(value + epsilon))
         : static_cast<int>(std::ceil(value - epsilon));
+}
+
+static double NormalizedStickAxis(int16_t value) {
+    return value < 0
+        ? static_cast<double>(value) / 32768.0
+        : static_cast<double>(value) / 32767.0;
+}
+
+static int16_t QuantizedStickAxis(double value) {
+    value = std::clamp(value, -1.0, 1.0);
+    const double scaled = value < 0 ? value * 32768.0 : value * 32767.0;
+    return static_cast<int16_t>(std::lround(scaled));
 }
 
 static double GyroCountsPerDegree(MouseMode mode) {
@@ -251,9 +355,18 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
         _source = MouseSourceAuto;
         _pointerMethod = PointerMethodOptical;
         _gyroSource = GyroMouseSourceFused;
+        _gyroOutputMode = GyroOutputModeMouse;
+        _gyroActivationMode = GyroActivationModeHold;
         _gyroAimingEnabled = NO;
-        _leftGyroToggleBinding = @"capture";
-        _rightGyroToggleBinding = @"chat";
+        _gyroOutputActive = NO;
+        _gyroToggleLatched = NO;
+        _gyroActivationPressedBindings = 0;
+        _gyroStickFullDeflectionRate = 180.0;
+        _gyroStickMinimumOutput = 0.12;
+        _gyroStickResponseCurve = 1.0;
+        _gyroActivationBinding1 = @"zl";
+        _gyroActivationBinding2 = @"none";
+        _gyroActivationBinding3 = @"none";
         _gyroActiveSourceName = @"none";
         _gyroCalibrating = YES;
         _opticalGestureChordActive = NO;
@@ -265,10 +378,6 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
         _gyroEmitClockValid = NO;
         _gyroFractionX = 0;
         _gyroFractionY = 0;
-        _gyroTogglePressedLeft = NO;
-        _gyroTogglePressedRight = NO;
-        _gyroLastToggleTapLeft = 0;
-        _gyroLastToggleTapRight = 0;
         _gyroButtonStateLeft = 0;
         _gyroButtonStateRight = 0;
         _gyroButtonTimestampLeft = 0;
@@ -278,6 +387,8 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
         _gyroStickTimestampLeft = 0;
         _gyroStickTimestampRight = 0;
         _gyroScrollAccumulator = 0;
+        _gyroRightStickX = 0;
+        _gyroRightStickY = 0;
         _lastActiveSide = JoyConSide::Right;
         _lastDistanceLeft = 0;
         _lastDistanceRight = 0;
@@ -336,45 +447,115 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
     [self updateGyroCalibrationState];
 }
 
+- (void)setGyroOutputMode:(GyroOutputMode)gyroOutputMode {
+    if (_gyroOutputMode == gyroOutputMode) return;
+    _gyroOutputMode = gyroOutputMode;
+    [self resetGyroOutputState];
+    [self releaseAllMouseButtons];
+}
+
+- (void)setGyroActivationMode:(GyroActivationMode)gyroActivationMode {
+    if (gyroActivationMode < GyroActivationModeContinuous
+        || gyroActivationMode > GyroActivationModeToggle) {
+        gyroActivationMode = GyroActivationModeContinuous;
+    }
+    if (_gyroActivationMode == gyroActivationMode) return;
+    _gyroActivationMode = gyroActivationMode;
+    _gyroToggleLatched = NO;
+    _gyroActivationPressedBindings = 0;
+    [self updateGyroOutputActive];
+}
+
+- (void)setGyroStickFullDeflectionRate:(double)value {
+    _gyroStickFullDeflectionRate = std::clamp(value, 30.0, 720.0);
+}
+
+- (void)setGyroStickMinimumOutput:(double)value {
+    _gyroStickMinimumOutput = std::clamp(value, 0.0, 0.5);
+}
+
+- (void)setGyroStickResponseCurve:(double)value {
+    _gyroStickResponseCurve = std::clamp(value, 0.25, 4.0);
+}
+
 - (void)setGyroAimingEnabled:(BOOL)gyroAimingEnabled {
     if (_gyroAimingEnabled == gyroAimingEnabled) return;
     _gyroAimingEnabled = gyroAimingEnabled;
+    if (!gyroAimingEnabled) _gyroToggleLatched = NO;
+    [self updateGyroOutputActive];
+}
+
+- (BOOL)isGyroOutputActive {
+    return _gyroOutputActive;
+}
+
+- (void)resetGyroOutputState {
     _gyroLastEmitTimestamp = 0;
     _gyroEmitClockValid = NO;
     _gyroFractionX = 0;
     _gyroFractionY = 0;
     _gyroScrollAccumulator = 0;
-    if (!gyroAimingEnabled) {
+    _gyroRightStickX = 0;
+    _gyroRightStickY = 0;
+}
+
+- (void)updateGyroOutputActive {
+    BOOL activationSatisfied = NO;
+    switch (_gyroActivationMode) {
+        case GyroActivationModeContinuous:
+            activationSatisfied = YES;
+            break;
+        case GyroActivationModeHold:
+            activationSatisfied = _gyroActivationPressedBindings != 0;
+            break;
+        case GyroActivationModeToggle:
+            activationSatisfied = _gyroToggleLatched;
+            break;
+    }
+
+    const BOOL nextActive = _gyroAimingEnabled && activationSatisfied;
+    if (_gyroOutputActive == nextActive) return;
+    _gyroOutputActive = nextActive;
+    [self resetGyroOutputState];
+    if (!nextActive) {
         _gyroActiveSourceName = @"none";
         [self releaseAllMouseButtons];
     }
 }
 
-- (void)setLeftGyroToggleBinding:(NSString *)binding {
-    _leftGyroToggleBinding = [binding copy];
-    _gyroTogglePressedLeft = NO;
-    _gyroLastToggleTapLeft = 0;
+- (void)setGyroActivationBinding1:(NSString *)binding {
+    _gyroActivationBinding1 = NormalizedGyroActivationBinding(binding);
+    _gyroToggleLatched = NO;
+    _gyroActivationPressedBindings = 0;
+    [self updateGyroOutputActive];
 }
 
-- (void)setRightGyroToggleBinding:(NSString *)binding {
-    _rightGyroToggleBinding = [binding copy];
-    _gyroTogglePressedRight = NO;
-    _gyroLastToggleTapRight = 0;
+- (void)setGyroActivationBinding2:(NSString *)binding {
+    _gyroActivationBinding2 = NormalizedGyroActivationBinding(binding);
+    _gyroToggleLatched = NO;
+    _gyroActivationPressedBindings = 0;
+    [self updateGyroOutputActive];
+}
+
+- (void)setGyroActivationBinding3:(NSString *)binding {
+    _gyroActivationBinding3 = NormalizedGyroActivationBinding(binding);
+    _gyroToggleLatched = NO;
+    _gyroActivationPressedBindings = 0;
+    [self updateGyroOutputActive];
 }
 
 - (void)resetGyroAiming {
     self.gyroAimingEnabled = NO;
-    _gyroTogglePressedLeft = NO;
-    _gyroTogglePressedRight = NO;
-    _gyroLastToggleTapLeft = 0;
-    _gyroLastToggleTapRight = 0;
+    _gyroToggleLatched = NO;
+    _gyroActivationPressedBindings = 0;
+    _gyroOutputActive = NO;
     _gyroButtonStateLeft = 0;
     _gyroButtonStateRight = 0;
     _gyroButtonTimestampLeft = 0;
     _gyroButtonTimestampRight = 0;
     _gyroStickTimestampLeft = 0;
     _gyroStickTimestampRight = 0;
-    _gyroScrollAccumulator = 0;
+    [self resetGyroOutputState];
 }
 
 - (void)requestGyroCalibration {
@@ -399,12 +580,34 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
     }
 }
 
-- (uint32_t)processGyroMotion:(MotionData)motion
-                         side:(JoyConSide)side
-                  buttonState:(uint32_t)buttonState
-                 stickReading:(StickData)stickReading {
+- (uint64_t)pressedGyroActivationBindingsAt:(double)now {
+    NSString *bindings[] = {
+        _gyroActivationBinding1,
+        _gyroActivationBinding2,
+        _gyroActivationBinding3
+    };
+    uint64_t pressedBindings = 0;
+    for (NSString *binding : bindings) {
+        const ResolvedGyroActivationBinding resolved = ResolveGyroActivationBinding(binding);
+        if (!resolved.valid) continue;
+
+        const uint32_t buttonState = resolved.side == JoyConSide::Left
+            ? _gyroButtonStateLeft : _gyroButtonStateRight;
+        const double timestamp = resolved.side == JoyConSide::Left
+            ? _gyroButtonTimestampLeft : _gyroButtonTimestampRight;
+        const bool fresh = timestamp > 0 && now >= timestamp && now - timestamp <= 0.0455;
+        if (fresh && (buttonState & resolved.mask) != 0) {
+            pressedBindings |= GyroActivationBindingBit(resolved.id);
+        }
+    }
+    return pressedBindings;
+}
+
+- (void)processGyroMotion:(MotionData)motion
+                     side:(JoyConSide)side
+              buttonState:(uint32_t)buttonState
+             stickReading:(StickData)stickReading {
     const double now = MonotonicSeconds();
-    uint32_t consumedMask = 0;
     @synchronized (self) {
         GyroPointerSample &sample = side == JoyConSide::Left ? _gyroLeft : _gyroRight;
         const double previousTimestamp = sample.timestamp;
@@ -436,31 +639,6 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
             }
         }
 
-        if (_pointerMethod == PointerMethodGyro) {
-            uint32_t mask = ToggleMaskForBinding(side == JoyConSide::Left
-                                                  ? _leftGyroToggleBinding
-                                                  : _rightGyroToggleBinding,
-                                                  side);
-            BOOL pressed = (buttonState & mask) != 0;
-            BOOL *wasPressed = side == JoyConSide::Left
-                                 ? &_gyroTogglePressedLeft
-                                 : &_gyroTogglePressedRight;
-            double *lastTap = side == JoyConSide::Left
-                                ? &_gyroLastToggleTapLeft
-                                : &_gyroLastToggleTapRight;
-            if (pressed && !*wasPressed) {
-                static const double DOUBLE_TAP_SECONDS = 0.35;
-                if (*lastTap > 0 && now - *lastTap <= DOUBLE_TAP_SECONDS) {
-                    *lastTap = 0;
-                    self.gyroAimingEnabled = !self.gyroAimingEnabled;
-                } else {
-                    *lastTap = now;
-                }
-            }
-            *wasPressed = pressed;
-            if (pressed) consumedMask = mask;
-            buttonState &= ~mask;
-        }
         if (side == JoyConSide::Left) {
             _gyroButtonStateLeft = buttonState;
             _gyroButtonTimestampLeft = now;
@@ -472,13 +650,27 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
             _gyroStickRight = stickReading;
             _gyroStickTimestampRight = now;
         }
-        if (_pointerMethod == PointerMethodGyro) {
+
+        const uint64_t pressedBindings = [self pressedGyroActivationBindingsAt:now];
+        const uint64_t risingBindings = pressedBindings & ~_gyroActivationPressedBindings;
+        _gyroActivationPressedBindings = pressedBindings;
+        if (_pointerMethod == PointerMethodGyro
+            && _gyroAimingEnabled
+            && _gyroActivationMode == GyroActivationModeToggle
+            && risingBindings != 0) {
+            _gyroToggleLatched = !_gyroToggleLatched;
+        }
+        [self updateGyroOutputActive];
+
+        if (_pointerMethod == PointerMethodGyro && _gyroOutputMode == GyroOutputModeMouse) {
             [self updateGyroMouseButtons];
             [self emitGyroPointerForPacketSide:side now:now];
+        } else if (_pointerMethod == PointerMethodGyro) {
+            [self releaseAllMouseButtons];
+            [self updateGyroRightStickForPacketSide:side now:now];
         }
         [self updateGyroCalibrationState];
     }
-    return consumedMask;
 }
 
 - (void)updateGyroCalibration:(GyroPointerSample &)sample now:(double)now {
@@ -543,7 +735,8 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
 }
 
 - (void)updateGyroMouseButtons {
-    if (_pointerMethod != PointerMethodGyro || !_gyroAimingEnabled) {
+    if (_pointerMethod != PointerMethodGyro || _gyroOutputMode != GyroOutputModeMouse
+        || !_gyroOutputActive) {
         [self releaseAllMouseButtons];
         return;
     }
@@ -572,16 +765,10 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
     }
 }
 
-- (void)emitGyroPointerForPacketSide:(JoyConSide)side now:(double)now {
-    if (_pointerMethod != PointerMethodGyro || !_gyroAimingEnabled
-        || _currentMode == MouseModeOff || !_driverClient || ![_driverClient isRunning]) {
-        _gyroLastEmitTimestamp = 0;
-        _gyroEmitClockValid = NO;
-        _gyroFractionX = _gyroFractionY = 0;
-        _gyroScrollAccumulator = 0;
-        return;
-    }
-
+- (GyroRateSelectionResult)selectGyroRatesForPacketSide:(JoyConSide)side
+                                                     now:(double)now
+                                                   rates:(PointerRates *)rates
+                                               deltaTime:(double *)deltaTime {
     const bool leftFresh = GyroSampleUsable(_gyroLeft, now);
     const bool rightFresh = GyroSampleUsable(_gyroRight, now);
     const bool packetSideFresh = side == JoyConSide::Left ? leftFresh : rightFresh;
@@ -617,64 +804,88 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
         _gyroActiveSourceName = @"none";
         _gyroLastEmitTimestamp = 0;
         _gyroEmitClockValid = NO;
-        _gyroFractionX = _gyroFractionY = 0;
-        _gyroScrollAccumulator = 0;
-        return;
+        if (deltaTime) *deltaTime = 0;
+        return GyroRateSelectionResult::Unavailable;
     }
 
     const bool clockChanged = !_gyroEmitClockValid || _gyroEmitClockSide != clockSide;
     _gyroEmitClockSide = clockSide;
     _gyroEmitClockValid = YES;
-    if (side != clockSide) return;
-
-    if (clockChanged || _gyroLastEmitTimestamp <= 0) {
-        _gyroLastEmitTimestamp = now;
-        _gyroScrollAccumulator = 0;
-        return;
+    if (side != clockSide) {
+        return GyroRateSelectionResult::NotClockPacket;
     }
 
-    double dt = now - _gyroLastEmitTimestamp;
-    if (dt <= 0) return;
-    _gyroLastEmitTimestamp = now;
-    if (dt > 0.0455) {
-        _gyroFractionX = _gyroFractionY = 0;
-        _gyroScrollAccumulator = 0;
-        return;
-    }
-    dt = std::min(dt, 0.025);
-
-    const GyroPointerSample *a = nullptr;
-    const GyroPointerSample *b = nullptr;
+    const GyroPointerSample *first = nullptr;
+    const GyroPointerSample *second = nullptr;
     if (_gyroSource == GyroMouseSourceLeft) {
-        if (leftFresh) a = &_gyroLeft;
+        if (leftFresh) first = &_gyroLeft;
     } else if (_gyroSource == GyroMouseSourceRight) {
-        if (rightFresh) a = &_gyroRight;
+        if (rightFresh) first = &_gyroRight;
     } else {
-        if (leftFresh) a = &_gyroLeft;
+        if (leftFresh) first = &_gyroLeft;
         if (rightFresh) {
-            if (a) b = &_gyroRight;
-            else a = &_gyroRight;
+            if (first) second = &_gyroRight;
+            else first = &_gyroRight;
         }
     }
-    if (!a) {
+
+    if (!first) {
         _gyroActiveSourceName = @"none";
+        _gyroLastEmitTimestamp = 0;
+        _gyroEmitClockValid = NO;
+        if (deltaTime) *deltaTime = 0;
+        return GyroRateSelectionResult::Unavailable;
+    }
+
+    double alignedTimestamp = first->timestamp;
+    if (second) alignedTimestamp = std::min(first->timestamp, second->timestamp);
+    PointerRates selectedRates = PointerRatesAt(*first, alignedTimestamp);
+    if (second) {
+        const PointerRates secondRates = PointerRatesAt(*second, alignedTimestamp);
+        selectedRates.pitch = (selectedRates.pitch + secondRates.pitch) * 0.5;
+        selectedRates.yaw = (selectedRates.yaw + secondRates.yaw) * 0.5;
+        _gyroActiveSourceName = @"fused";
+    } else {
+        _gyroActiveSourceName = first == &_gyroLeft ? @"left" : @"right";
+    }
+    if (rates) *rates = selectedRates;
+
+    double dt = 0;
+    if (!clockChanged && _gyroLastEmitTimestamp > 0) {
+        dt = now - _gyroLastEmitTimestamp;
+        if (dt <= 0 || dt > 0.0455) dt = 0;
+        else dt = std::min(dt, 0.025);
+    }
+    _gyroLastEmitTimestamp = now;
+    if (deltaTime) *deltaTime = dt;
+    return GyroRateSelectionResult::Ready;
+}
+
+- (void)emitGyroPointerForPacketSide:(JoyConSide)side now:(double)now {
+    if (_pointerMethod != PointerMethodGyro || !_gyroOutputActive
+        || _gyroOutputMode != GyroOutputModeMouse || _currentMode == MouseModeOff
+        || !_driverClient || ![_driverClient isRunning]) {
+        _gyroLastEmitTimestamp = 0;
+        _gyroEmitClockValid = NO;
         _gyroFractionX = _gyroFractionY = 0;
         _gyroScrollAccumulator = 0;
         return;
     }
 
-    double alignedTimestamp = a->timestamp;
-    if (b) alignedTimestamp = std::min(a->timestamp, b->timestamp);
-    PointerRates rates = PointerRatesAt(*a, alignedTimestamp);
-    double pitch = rates.pitch;
-    double yaw = rates.yaw;
-    if (b) {
-        const PointerRates secondRates = PointerRatesAt(*b, alignedTimestamp);
-        pitch = (pitch + secondRates.pitch) * 0.5;
-        yaw = (yaw + secondRates.yaw) * 0.5;
-        _gyroActiveSourceName = @"fused";
-    } else {
-        _gyroActiveSourceName = a == &_gyroLeft ? @"left" : @"right";
+    PointerRates rates = {0, 0};
+    double dt = 0;
+    const GyroRateSelectionResult result =
+        [self selectGyroRatesForPacketSide:side now:now rates:&rates deltaTime:&dt];
+    if (result == GyroRateSelectionResult::Unavailable) {
+        _gyroFractionX = _gyroFractionY = 0;
+        _gyroScrollAccumulator = 0;
+        return;
+    }
+    if (result == GyroRateSelectionResult::NotClockPacket) return;
+    if (dt <= 0) {
+        _gyroFractionX = _gyroFractionY = 0;
+        _gyroScrollAccumulator = 0;
+        return;
     }
 
     int scroll = 0;
@@ -701,14 +912,70 @@ static bool GyroSampleUsable(const GyroPointerSample &sample, double now) {
     }
 
     const double countsPerDegree = GyroCountsPerDegree(_currentMode);
-    _gyroFractionX += yaw * dt * countsPerDegree;
-    _gyroFractionY += -pitch * dt * countsPerDegree;
+    _gyroFractionX += rates.yaw * dt * countsPerDegree;
+    _gyroFractionY += -rates.pitch * dt * countsPerDegree;
     const int dx = ExtractWholeMouseDelta(_gyroFractionX);
     const int dy = ExtractWholeMouseDelta(_gyroFractionY);
     _gyroFractionX -= dx;
     _gyroFractionY -= dy;
     if (dx != 0 || dy != 0 || scroll != 0) {
         [self postMouseReportDeltaX:dx deltaY:dy scroll:scroll];
+    }
+}
+
+- (void)updateGyroRightStickForPacketSide:(JoyConSide)side now:(double)now {
+    if (_pointerMethod != PointerMethodGyro || !_gyroOutputActive
+        || _gyroOutputMode != GyroOutputModeRightStick || _currentMode == MouseModeOff) {
+        _gyroRightStickX = _gyroRightStickY = 0;
+        return;
+    }
+
+    PointerRates rates = {0, 0};
+    const GyroRateSelectionResult result =
+        [self selectGyroRatesForPacketSide:side now:now rates:&rates deltaTime:nullptr];
+    if (result == GyroRateSelectionResult::NotClockPacket) return;
+    if (result == GyroRateSelectionResult::Unavailable || _gyroCalibrating) {
+        _gyroRightStickX = _gyroRightStickY = 0;
+        return;
+    }
+
+    const double inputX = rates.yaw;
+    const double inputY = -rates.pitch;
+    const double magnitude = std::hypot(inputX, inputY);
+    static const double activationRate = 0.75;
+    if (magnitude <= activationRate) {
+        _gyroRightStickX = _gyroRightStickY = 0;
+        return;
+    }
+
+    const double normalizedRate = std::clamp(
+        (magnitude - activationRate) / (_gyroStickFullDeflectionRate - activationRate),
+        0.0, 1.0);
+    const double curvedRate = std::pow(normalizedRate, _gyroStickResponseCurve);
+    const double outputMagnitude = _gyroStickMinimumOutput
+        + (1.0 - _gyroStickMinimumOutput) * curvedRate;
+    _gyroRightStickX = inputX / magnitude * outputMagnitude;
+    _gyroRightStickY = inputY / magnitude * outputMagnitude;
+}
+
+- (StickData)composeGyroRightStickWithPhysical:(StickData)physicalStick {
+    @synchronized (self) {
+        if (_pointerMethod != PointerMethodGyro || !_gyroOutputActive
+            || _gyroOutputMode != GyroOutputModeRightStick
+            || _currentMode == MouseModeOff || _gyroCalibrating) {
+            return physicalStick;
+        }
+
+        double x = NormalizedStickAxis(physicalStick.x) + _gyroRightStickX;
+        double y = NormalizedStickAxis(physicalStick.y) + _gyroRightStickY;
+        const double magnitude = std::hypot(x, y);
+        if (magnitude > 1.0) {
+            x /= magnitude;
+            y /= magnitude;
+        }
+        physicalStick.x = QuantizedStickAxis(x);
+        physicalStick.y = QuantizedStickAxis(y);
+        return physicalStick;
     }
 }
 
